@@ -574,6 +574,22 @@ async function refreshHome() {
   }
 }
 
+// Competition page: live battles, coin duels, weekly season and prize pool.
+async function refreshCompetition() {
+  if (!$('competitionPage')) return;
+  try {
+    const [battles, duels] = await Promise.all([
+      view('list_battles', { from_index: 0, limit: 50 }).catch(() => []),
+      view('list_coin_duels', { from_index: 0, limit: 50 }).catch(() => []),
+    ]);
+    renderBattles(battles, duels);
+    renderSeasonPanel();
+    renderWeeklyBoard();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
 // Arena page: live facts about PAC Arena (coins, agents, trades, prize pool).
 async function refreshArena() {
   if (!$('arena-coins')) return;
@@ -1183,6 +1199,7 @@ let currentCoinId = null;
 let currentAgent = null;
 function refreshCurrent() {
   if (currentPage === 'home') refreshHome();
+  else if (currentPage === 'competition') refreshCompetition();
   else if (currentPage === 'coin' && currentCoinId !== null) showCoin(currentCoinId);
   else if (currentPage === 'agents') { if (currentAgent) showAgent(currentAgent); else refreshAgents(); }
   else if (currentPage === 'arena') refreshArena();
@@ -1211,6 +1228,9 @@ function initPage() {
       if (ap) ap.classList.add('hidden');
       refreshAgents();
     }
+  } else if ($('competitionPage')) {
+    currentPage = 'competition';
+    refreshCompetition();
   } else if ($('arena-coins')) {
     currentPage = 'arena';
     refreshArena();
