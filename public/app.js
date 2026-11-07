@@ -6,13 +6,17 @@ const ARENA_ID = 'pac-arena.testnet';
 // rate-limits bursts (HTTP 429), so reads fall back to it on failure.
 const RPC_URLS = ['https://rpc.testnet.fastnear.com', 'https://rpc.testnet.near.org'];
 const RPC_URL = RPC_URLS[0];
-const EXPLORER = 'https://explorer.testnet.near.org';
+const EXPLORER = 'https://testnet.nearblocks.io';
 const NEAR = 10n ** 24n;
 const GAS_LAUNCH = 300_000_000_000_000n; // launch deploys a ~197KB token contract
 const GAS_STD = 100_000_000_000_000n;
 const BATTLE_FORFEIT_NEAR = '0.1';
 
-document.getElementById('arenaLink').href = EXPLORER + '/accounts/' + ARENA_ID;
+// The arena link stays in the header (desktop nav and mobile menu),
+// labelled "PAC Arena", pointing at the explorer page for the arena
+// account. Every page carries the link with class "arena-link".
+const ARENA_HREF = EXPLORER + '/address/' + ARENA_ID;
+document.querySelectorAll('.arena-link').forEach((a) => { a.href = ARENA_HREF; });
 
 // ---------- helpers ----------
 const $ = (id) => document.getElementById(id);
@@ -195,7 +199,7 @@ async function refreshCoinChart(coinId) {
       view('get_coin', { coin_id: coinId }),
       view('get_activity', { limit: FEED_LIMIT }),
     ]);
-    if (coinChartId !== coinId || $('view-coin').classList.contains('hidden')) return;
+    if (coinChartId !== coinId) return;
     const history = reconstructHistory(coinId, BigInt(coin.sold_tokens), activity);
     box.innerHTML = priceChartSvg(history);
     const note = $('coinChartNote');
@@ -245,8 +249,8 @@ function toggleFollow(account) {
   const i = list.indexOf(account);
   if (i >= 0) list.splice(i, 1); else list.push(account);
   setFollows(list);
-  refreshHome();
-  if (!$('view-agent').classList.contains('hidden')) showAgent(account);
+  refreshCurrent();
+  if (currentPage === 'agents' && currentAgent === account) showAgent(account);
 }
 function followBtn(account) {
   return `<button class="followbtn" onclick="event.stopPropagation();toggleFollow('${esc(account)}')">${isFollowing(account) ? 'Unfollow' : 'Follow'}</button>`;
@@ -260,7 +264,7 @@ function renderWatchlist(activity) {
   box.innerHTML = follows.map((acct) => {
     const trades = items.filter((e) => e.agent === acct && (e.kind === 'buy' || e.kind === 'sell')).slice(0, 5);
     return `<div class="panel small" style="margin-bottom:8px;">
-      <div class="row"><b><a href="#/agent/${esc(acct)}">${esc(acct)}</a></b><button class="followbtn" onclick="toggleFollow('${esc(acct)}')">Unfollow</button></div>
+      <div class="row"><b><a href="agents.html?agent=${esc(acct)}">${esc(acct)}</a></b><button class="followbtn" onclick="toggleFollow('${esc(acct)}')">Unfollow</button></div>
       ${trades.length ? `<div class="feed" style="margin-top:8px;">${trades.map((t) => {
         const idx = items.indexOf(t);
         const coin = coinsCache.find((c) => c.id === t.coin_id);
@@ -272,18 +276,20 @@ function renderWatchlist(activity) {
 }
 
 // ---------- manual copy ----------
-// One tap manual copy: fills in the buy or sell form on the coin page.
-// The visitor still confirms the trade in their wallet. No auto copy.
-let pendingCopy = null;
+// The pending copy survives the page navigation via sessionStorage:
+// copying from the feed opens the coin page, which fills the form.
+const PENDING_COPY_KEY = 'pac-pending-copy';
 function copyTrade(idx) {
   const e = activityCache[idx];
   if (!e) return;
-  pendingCopy = { coinId: e.coin_id, kind: e.kind, tokens: e.tokens, nearYocto: e.near_yocto };
-  location.hash = '#/coin/' + e.coin_id;
+  try { sessionStorage.setItem(PENDING_COPY_KEY, JSON.stringify({ coinId: e.coin_id, kind: e.kind, tokens: e.tokens, nearYocto: e.near_yocto })); } catch { /* storage unavailable */ }
+  location.href = 'coin.html?coin=' + e.coin_id;
 }
 function applyPendingCopy(coinId) {
-  if (!pendingCopy || pendingCopy.coinId !== coinId) return;
-  const pc = pendingCopy; pendingCopy = null;
+  let pc = null;
+  try { pc = JSON.parse(sessionStorage.getItem(PENDING_COPY_KEY) || 'null'); } catch { pc = null; }
+  if (!pc || pc.coinId !== coinId) return;
+  try { sessionStorage.removeItem(PENDING_COPY_KEY); } catch { /* ignore */ }
   if (pc.kind === 'buy') {
     const b = $('buyAmount');
     if (b) { b.value = fmtNear(pc.nearYocto); scrollToEl(b); }
@@ -328,7 +334,7 @@ async function renderWeeklyBoard() {
     const start = new Date(Number(BigInt(season.start_ns) / 1000000n));
     if (label) label.textContent = 'Season ' + season.id + ' · week of ' + start.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC). Prize pool ' + fmtNear(season.pool_yocto) + ' NEAR.';
     body.innerHTML = board.length ? board.slice(0, 20).map((r, i) => `
-      <tr onclick="location.hash='#/agent/${esc(r.account)}'">
+      <tr onclick="location.href='agents.html?agent=${esc(r.account)}'">
         <td>${i + 1}</td><td>${esc(r.account)}</td>
         <td>${fmtNear(r.realised_pnl_yocto)} NEAR</td>
       </tr>`).join('') : '<tr><td colspan="3" class="muted">No trades this week yet.</td></tr>';
@@ -351,7 +357,7 @@ async function renderSeasonPanel() {
     const box = $('lastSeasonBox');
     if (last && last.status === 'resolved' && last.winners.length) {
       box.innerHTML = '<h3>Last season winners</h3>' + last.winners.map((w, i) => `
-        <div class="row" style="margin-top:6px;"><span><b>#${i + 1}</b> <a href="#/agent/${esc(w)}">${esc(w)}</a></span><b>${fmtNear(last.payouts_yocto[i])} NEAR</b></div>`).join('');
+        <div class="row" style="margin-top:6px;"><span><b>#${i + 1}</b> <a href="agents.html?agent=${esc(w)}">${esc(w)}</a></span><b>${fmtNear(last.payouts_yocto[i])} NEAR</b></div>`).join('');
     } else if (last && last.status === 'resolved') {
       box.innerHTML = '<p class="muted small">Last season resolved with no winners — the whole pool rolled into this season.</p>';
     } else {
@@ -415,11 +421,12 @@ async function initWallet() {
     const id = (restored && typeof restored.accountId === 'string' && restored.accountId) || currentAccountId(nw);
     if (id) walletAccountId = id;
   } catch (e) { console.warn('wallet restore failed', e); }
-  // Clean the wallet return params off the URL, keeping the route.
+  // Clean the wallet return params off the URL, keeping the page and
+  // its query string (the coin page needs ?coin=N to stay).
   try {
     const params = new URLSearchParams(window.location.search);
     if (params.get('transactionHashes')) {
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+      window.history.replaceState({}, '', window.location.pathname + window.location.search + window.location.hash);
     }
   } catch (_) { /* ignore */ }
   refreshWalletBtn();
@@ -485,6 +492,7 @@ async function loadParams() {
 }
 
 async function refreshHome() {
+  if (!$('coinGrid')) return;
   try {
     const [stats, coins, activity, battles, duels, fullActivity] = await Promise.all([
       view('get_stats', {}),
@@ -505,8 +513,6 @@ async function refreshHome() {
     renderCoins(coins, historyByCoin);
     renderActivity(activity);
     renderBattles(battles, duels);
-    renderLeaderboard(coins, activity);
-    renderWeeklyBoard();
     renderSeasonPanel();
     renderWatchlist(activity);
     const params = await loadParams();
@@ -527,12 +533,45 @@ async function refreshHome() {
       </div>`;
   } catch (e) {
     console.error(e);
-    status('Failed to load arena data: ' + String(e.message).slice(0, 120), 8000);
+    status('Failed to load PAC Arena data: ' + String(e.message).slice(0, 120), 8000);
+  }
+}
+
+// Arena page: live facts about PAC Arena (coins, agents, trades, prize pool).
+async function refreshArena() {
+  if (!$('arena-coins')) return;
+  try {
+    const [stats, pool] = await Promise.all([view('get_stats', {}), view('get_prize_pool', {})]);
+    $('arena-coins').textContent = stats.coins;
+    $('arena-agents').textContent = stats.agents;
+    $('arena-trades').textContent = stats.trades;
+    $('arena-pool').textContent = fmtNear(pool) + ' NEAR';
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// Agents page: the all-time leaderboard plus the weekly board.
+async function refreshAgents() {
+  if (!$('leaderBody')) return;
+  try {
+    const [coins, activity] = await Promise.all([
+      view('list_coins', { from_index: 0, limit: 50 }),
+      view('get_activity', { limit: 50 }),
+    ]);
+    coinsCache = coins;
+    activityCache = activity.slice().reverse();
+    renderLeaderboard(coins, activity);
+    renderWeeklyBoard();
+  } catch (e) {
+    console.error(e);
+    status('Failed to load agent data: ' + String(e.message).slice(0, 120), 8000);
   }
 }
 
 function renderCoins(coins, historyByCoin) {
   const grid = $('coinGrid');
+  if (!grid) return;
   if (!coins.length) { grid.innerHTML = '<p class="muted">No coins yet — launch the first one below.</p>'; return; }
   grid.innerHTML = coins.map((c) => {
     const history = historyByCoin ? historyByCoin[c.id] : null;
@@ -540,8 +579,8 @@ function renderCoins(coins, historyByCoin) {
     const chgHtml = chg ? ` <span class="${chg.pct >= 0 ? 'chg-up' : 'chg-down'}">${chg.pct >= 0 ? '+' : ''}${chg.pct.toFixed(1)}% ${chg.sinceLaunch ? 'since launch' : '24h'}</span>` : '';
     const spark = history ? sparklineSvg(history) : '';
     return `
-    <div class="card" onclick="location.hash='#/coin/${c.id}'">
-      <div class="top"><img src="${coinImgSrc(c)}" data-sym="${esc(c.symbol)}" onerror="imgFallback(this)" alt=""><div><div class="name">${esc(c.name)}</div><div class="sym">$${esc(c.symbol)} · by <a href="#/agent/${esc(c.creator)}" onclick="event.stopPropagation()">${esc(c.creator)}</a></div></div></div>
+    <div class="card" onclick="location.href='coin.html?coin=${c.id}'">
+      <div class="top"><img src="${coinImgSrc(c)}" data-sym="${esc(c.symbol)}" onerror="imgFallback(this)" alt=""><div><div class="name">${esc(c.name)}</div><div class="sym">$${esc(c.symbol)} · by <a href="agents.html?agent=${esc(c.creator)}" onclick="event.stopPropagation()">${esc(c.creator)}</a></div></div></div>
       <div class="desc">${esc(c.description)}</div>
       ${spark ? `<div class="sparkwrap">${spark}</div>` : ''}
       <div class="nums"><span>Market cap</span><b>${fmtNear(c.market_cap_yocto)} NEAR</b></div>
@@ -555,6 +594,7 @@ function renderCoins(coins, historyByCoin) {
 
 function renderActivity(activity) {
   const list = $('feedList');
+  if (!list) return;
   const items = activity.slice().reverse();
   activityCache = items;
   if (!items.length) { list.innerHTML = '<p class="muted">No activity yet.</p>'; return; }
@@ -564,19 +604,21 @@ function renderActivity(activity) {
     const sym = coin ? coin.symbol : '?';
     const coinName = coin ? esc(coin.name) : ('coin ' + e.coin_id);
     const canCopy = e.kind === 'buy' || e.kind === 'sell';
-    return `<div class="feeditem"><img src="${img}" data-sym="${esc(sym)}" onerror="imgFallback(this)" alt=""><div><b><a href="#/agent/${esc(e.agent)}">${esc(e.agent)}</a></b> ${esc(e.kind)} <b>${coinName}</b> <span class="muted">${esc(e.note || '')}</span></div><div class="feedactions"><button onclick="shareActivity(${i})">Share</button>${canCopy ? `<button onclick="copyTrade(${i})">Copy</button>` : ''}</div><span class="time">${timeAgo(e.timestamp_ns)}</span></div>`;
+    return `<div class="feeditem"><img src="${img}" data-sym="${esc(sym)}" onerror="imgFallback(this)" alt=""><div><b><a href="agents.html?agent=${esc(e.agent)}">${esc(e.agent)}</a></b> ${esc(e.kind)} <b>${coinName}</b> <span class="muted">${esc(e.note || '')}</span></div><div class="feedactions"><button onclick="shareActivity(${i})">Share</button>${canCopy ? `<button onclick="copyTrade(${i})">Copy</button>` : ''}</div><span class="time">${timeAgo(e.timestamp_ns)}</span></div>`;
   }).join('');
 }
 
 function renderBattles(battles, duels) {
-  $('battleList').innerHTML = battles.length ? battles.slice().reverse().map((b) => `
+  const battleEl = $('battleList');
+  if (battleEl) battleEl.innerHTML = battles.length ? battles.slice().reverse().map((b) => `
     <div class="panel small" style="margin-bottom:8px;">
       <div class="row"><b>Battle ${b.id}</b><span class="pill ${b.status}">${esc(b.status)}</span><span class="muted">${esc(b.agent_a)} vs ${esc(b.agent_b)}</span></div>
       <div class="muted small">Coin ${b.coin_id} · forfeit ${fmtNear(b.forfeit_yocto)} NEAR · ends ${fmtTime(b.end_ns)}${b.winner ? ' · winner: ' + esc(b.winner) : ''}</div>
       ${b.status === 'active' && getWalletAccountId() === b.agent_b ? `<button onclick="acceptBattle(${b.id})">Accept (0.1 NEAR)</button>` : ''}
       ${b.status === 'active' ? `<button onclick="resolveBattle(${b.id})">Resolve</button>` : ''}
     </div>`).join('') : '<p class="muted">No battles yet.</p>';
-  $('duelList').innerHTML = duels.length ? duels.slice().reverse().map((d) => `
+  const duelEl = $('duelList');
+  if (duelEl) duelEl.innerHTML = duels.length ? duels.slice().reverse().map((d) => `
     <div class="panel small" style="margin-bottom:8px;">
       <div class="row"><b>Duel ${d.id}</b><span class="pill ${d.status}">${esc(d.status)}</span><span class="muted">Coin ${d.coin_a} vs coin ${d.coin_b}</span></div>
       <div class="muted small">24h on trading volume · loser pays 5% of its treasury · ends ${fmtTime(d.end_ns)}${d.winner !== null && d.winner !== undefined ? ' · winner: coin ' + d.winner : ''}</div>
@@ -595,8 +637,10 @@ async function renderLeaderboard(coins, activity) {
   rows.sort((a, b) => (b.score - a.score) || (BigInt(b.realised_pnl_yocto) > BigInt(a.realised_pnl_yocto) ? 1 : -1));
   const copyStats = await Promise.all(rows.slice(0, 20).map((a) =>
     view('get_copy_stats', { leader: a.account }).catch(() => ({ copier_count: 0, total_fees_earned_yocto: '0' }))));
-  $('leaderBody').innerHTML = rows.length ? rows.slice(0, 20).map((a, i) => `
-    <tr onclick="location.hash='#/agent/${esc(a.account)}'">
+  const leaderEl = $('leaderBody');
+  if (!leaderEl) return;
+  leaderEl.innerHTML = rows.length ? rows.slice(0, 20).map((a, i) => `
+    <tr onclick="location.href='agents.html?agent=${esc(a.account)}'">
       <td>${i + 1}</td><td>${esc(a.account)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''} ${followBtn(a.account)}</td>
       <td class="score">${a.score}<span class="band ${a.band}">${esc(a.band)}</span></td>
       <td>${fmtNear(a.realised_pnl_yocto)} NEAR</td><td>${(a.win_rate_bp / 100).toFixed(1)}%</td>
@@ -607,10 +651,9 @@ async function renderLeaderboard(coins, activity) {
 
 // ---------- coin detail ----------
 async function showCoin(id) {
-  $('view-home').classList.add('hidden');
-  $('view-agent').classList.add('hidden');
-  $('view-coin').classList.remove('hidden');
+  currentCoinId = id;
   const el = $('coinDetail');
+  if (!el) return;
   el.innerHTML = '<p class="muted">Loading coin…</p>';
   try {
     const [coin, rounds, memeDay, params, allBattles] = await Promise.all([
@@ -632,7 +675,7 @@ async function showCoin(id) {
         <div class="top row" style="align-items:center;"><img src="${coinImgSrc(coin)}" data-sym="${esc(coin.symbol)}" onerror="imgFallback(this)" style="width:64px;height:64px;border-radius:50%;" alt="">
           <div><h2 style="margin:0;">${esc(coin.name)} <span class="muted">$${esc(coin.symbol)}</span> ${gradBadge(coin)}</h2>
           <div class="muted small">${esc(coin.description)}</div>
-          <div class="small">Token: <a class="mono" href="${EXPLORER}/accounts/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="#/agent/${esc(coin.creator)}">${esc(coin.creator)}</a> · <button onclick="shareCoin(${coin.id})">Share</button></div></div></div>
+          <div class="small">Token: <a class="mono" href="${EXPLORER}/address/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="agents.html?agent=${esc(coin.creator)}">${esc(coin.creator)}</a> · <button onclick="shareCoin(${coin.id})">Share</button></div></div></div>
         <div class="reactive">This coin has triggered <b>${milestoneCount}</b> milestones / <b>${voteCount}</b> supply votes / <b>${battleCount}</b> battles<span>Reactive history — every milestone, vote and battle is onchain.</span></div>
         <div class="kv" style="margin-top:14px;">
           <span>Market cap</span><b>${fmtNear(coin.market_cap_yocto)} NEAR</b>
@@ -652,25 +695,34 @@ async function showCoin(id) {
           <button onclick="setCoinImage(${coin.id})">Set image</button>
         </div>
         <p class="muted small">Only the coin creator can set the image. It is stored onchain and shown on the coin card and here. Leave it blank to clear the image.</p>` : ''}
-        <div class="row" style="margin-top:14px;">
-          <input id="buyAmount" type="number" min="0.01" step="0.01" value="0.1" placeholder="NEAR to spend">
-          <button class="primary" onclick="buyCoin(${coin.id})">Buy</button>
-          <input id="sellAmount" type="number" min="1" step="1" placeholder="Tokens to sell">
-          <button onclick="sellCoin(${coin.id})">Sell</button>
-          <button onclick="claimLocked(${coin.id})">Claim locked</button>
-          ${BigInt(coin.airdrop_per_holder) > 0n ? `<button onclick="claimAirdrop(${coin.id})">Claim airdrop</button>` : ''}
+      </div>
+
+      <div class="twocol" style="margin-top:16px;">
+        <div class="panel">
+          <h3 style="margin-top:0;">Live price chart</h3>
+          <p class="muted small">Price in NEAR per token over time, one point per trade, rebuilt from the onchain activity feed. Current price: <span id="coinLivePrice">${fmtNear(coin.price_per_token_yocto)} NEAR / token</span></p>
+          <div id="coinChart"><p class="muted">Loading price history…</p></div>
+          <div class="chartnote" id="coinChartNote"></div>
         </div>
-        <p class="muted small">Buy: attaches NEAR to the curve. Sell: sends tokens to the arena with ft_transfer_call (msg "sell") and pays NEAR from the curve reserve. First buy needs a one-time 0.01 NEAR storage deposit on the token — the Buy button does that first if needed.</p>
+        <div class="panel">
+          <h3 style="margin-top:0;">Trade</h3>
+          <div class="row" style="margin-top:6px;">
+            <input id="buyAmount" type="number" min="0.01" step="0.01" value="0.1" placeholder="NEAR to spend">
+            <button class="primary" onclick="buyCoin(${coin.id})">Buy</button>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <input id="sellAmount" type="number" min="1" step="1" placeholder="Tokens to sell">
+            <button onclick="sellCoin(${coin.id})">Sell</button>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <button onclick="claimLocked(${coin.id})">Claim locked</button>
+            ${BigInt(coin.airdrop_per_holder) > 0n ? `<button onclick="claimAirdrop(${coin.id})">Claim airdrop</button>` : ''}
+          </div>
+          <p class="muted small">Buy: attaches NEAR to the curve. Sell: sends tokens to the arena with ft_transfer_call (msg "sell") and pays NEAR from the curve reserve. First buy needs a one-time 0.01 NEAR storage deposit on the token — the Buy button does that first if needed.</p>
+        </div>
       </div>
 
-      <div class="panel" style="margin-top:16px;">
-        <h3 style="margin-top:0;">Live price chart</h3>
-        <p class="muted small">Price in NEAR per token over time, one point per trade, rebuilt from the onchain activity feed. Current price: <span id="coinLivePrice">${fmtNear(coin.price_per_token_yocto)} NEAR / token</span></p>
-        <div id="coinChart"><p class="muted">Loading price history…</p></div>
-        <div class="chartnote" id="coinChartNote"></div>
-      </div>
-
-      <div class="twocol">
+      <div class="twocol" style="margin-top:16px;">
         <div class="panel">
           <h3>Supply votes — holders decide, supply reacts</h3>
           ${rounds.length ? rounds.slice().reverse().map((r) => `
@@ -726,10 +778,9 @@ async function showCoin(id) {
 
 // ---------- agent view ----------
 async function showAgent(accountId) {
-  $('view-home').classList.add('hidden');
-  $('view-coin').classList.add('hidden');
-  $('view-agent').classList.remove('hidden');
+  currentAgent = accountId;
   const el = $('agentDetail');
+  if (!el) return;
   el.innerHTML = '<p class="muted">Loading agent…</p>';
   try {
     const [agent, trades] = await Promise.all([
@@ -800,6 +851,54 @@ async function showAgent(accountId) {
   }
 }
 
+// ---------- AI generated launch image (optional) ----------
+// Off by default. When the user opts in, an image is generated server side
+// through /api/generate-image (the browser never holds the NEAR AI key) and
+// the hosted URL is filled into the image URL input. Launching without an
+// image, or with a pasted URL, always stays possible.
+function aiImagePromptDefault() {
+  const name = ($('launchName').value || '').trim();
+  const desc = ($('launchDesc').value || '').trim();
+  const base = name ? `A memecoin mascot for ${name}` : 'A memecoin mascot';
+  const withDesc = desc ? `${base}: ${desc}` : base;
+  return `${withDesc}, bold flat colors, centered, no text`.slice(0, 500);
+}
+function toggleAiImage() {
+  const on = $('aiImageOptIn').checked;
+  $('aiImagePanel').classList.toggle('hidden', !on);
+  if (on && !$('aiImagePrompt').value) $('aiImagePrompt').value = aiImagePromptDefault();
+}
+async function generateCoinImage() {
+  const prompt = ($('aiImagePrompt').value || '').trim();
+  if (!prompt) { status('Enter an image prompt first.'); return; }
+  if (prompt.length > 500) { status('Image prompt must be at most 500 characters.'); return; }
+  const btn = $('aiImageBtn');
+  btn.disabled = true;
+  $('aiImageStatus').textContent = 'Generating image with NEAR AI…';
+  try {
+    const res = await fetch('/api/generate-image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Image generation failed (${res.status}).`);
+    if (!data.image_url || !/^https?:\/\//.test(data.image_url) || data.image_url.length > 500) {
+      throw new Error('The image service returned an unusable URL.');
+    }
+    $('launchImage').value = data.image_url;
+    const preview = $('aiImagePreview');
+    preview.src = data.image_url;
+    preview.classList.remove('hidden');
+    $('aiImageStatus').textContent = 'Image ready. The image URL is filled in above. You can still change it or launch without it.';
+    status('AI image ready.', 6000);
+  } catch (e) {
+    $('aiImageStatus').textContent = 'Image generation failed: ' + String(e.message).slice(0, 160) + ' You can still launch without an image or paste an image URL.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---------- actions ----------
 async function launchCoin() {
   const me = requireWallet(); if (!me) return;
@@ -817,8 +916,8 @@ async function launchCoin() {
     const deposit = initialBuy + BigInt(params.launch_cost_yocto);
     status('Launching — confirm in your wallet…', 0);
     await walletCall(ARENA_ID, 'launch_coin', { name, symbol, description: desc, initial_buy_yocto: initialBuy.toString(), image_url: imgUrl || null }, deposit, GAS_LAUNCH);
-    status('Coin launched! It appears below once the token deploys (a few seconds).', 9000);
-    setTimeout(refreshHome, 4000);
+    status('Coin launched! Opening the coin list — it appears once the token deploys (a few seconds).', 9000);
+    setTimeout(() => { location.href = 'index.html'; }, 4000);
   } catch (e) { status('Launch failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function buyCoin(coinId) {
@@ -882,12 +981,12 @@ async function createVote(coinId) {
 }
 async function voteRound(roundId, choiceIndex) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'vote', { round_id: roundId, choice_index: choiceIndex }, 0n); status('Vote recorded (weight = your holdings).', 6000); setTimeout(refreshHome, 3000); }
+  try { await walletCall(ARENA_ID, 'vote', { round_id: roundId, choice_index: choiceIndex }, 0n); status('Vote recorded (weight = your holdings).', 6000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Vote failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function executeVote(roundId) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'execute_vote_round', { round_id: roundId }, 0n); status('Vote executed — supply changed onchain.', 8000); setTimeout(refreshHome, 3000); }
+  try { await walletCall(ARENA_ID, 'execute_vote_round', { round_id: roundId }, 0n); status('Vote executed — supply changed onchain.', 8000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Execute failed (deadline may not have passed): ' + String(e.message).slice(0, 160), 9000); }
 }
 async function createBattle(coinId) {
@@ -898,17 +997,17 @@ async function createBattle(coinId) {
     status('Challenging — confirm 0.1 NEAR forfeit in your wallet…', 0);
     await walletCall(ARENA_ID, 'create_battle', { coin_id: coinId, opponent }, parseNearFloat(BATTLE_FORFEIT_NEAR));
     status('Battle created! The opponent accepts with their own 0.1 NEAR.', 8000);
-    setTimeout(refreshHome, 3000);
+    setTimeout(() => showCoin(coinId), 3000);
   } catch (e) { status('Challenge failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function acceptBattle(battleId) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'accept_battle', { battle_id: battleId }, parseNearFloat(BATTLE_FORFEIT_NEAR)); status('Battle accepted — 24h window running.', 8000); setTimeout(refreshHome, 3000); }
+  try { await walletCall(ARENA_ID, 'accept_battle', { battle_id: battleId }, parseNearFloat(BATTLE_FORFEIT_NEAR)); status('Battle accepted — 24h window running.', 8000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Accept failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function resolveBattle(battleId) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'resolve_battle', { battle_id: battleId }, 0n); status('Battle resolved — winner paid automatically.', 8000); setTimeout(refreshHome, 3000); }
+  try { await walletCall(ARENA_ID, 'resolve_battle', { battle_id: battleId }, 0n); status('Battle resolved — winner paid automatically.', 8000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Resolve failed (window may not be over): ' + String(e.message).slice(0, 160), 9000); }
 }
 async function createDuel(coinId) {
@@ -920,7 +1019,7 @@ async function createDuel(coinId) {
 }
 async function resolveDuel(duelId) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'resolve_coin_duel', { duel_id: duelId }, 0n); status('Duel resolved — loser paid 5% of its treasury.', 8000); setTimeout(refreshHome, 3000); }
+  try { await walletCall(ARENA_ID, 'resolve_coin_duel', { duel_id: duelId }, 0n); status('Duel resolved — loser paid 5% of its treasury.', 8000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Resolve failed (window may not be over): ' + String(e.message).slice(0, 160), 9000); }
 }
 async function submitMeme(coinId) {
@@ -980,26 +1079,56 @@ async function resolveCurrentSeason() {
     const season = await view('get_current_season', {});
     await walletCall(ARENA_ID, 'resolve_season', { season_id: season.id - 1 }, 0n);
     status('Last season resolved — top 3 paid from the prize pool.', 8000);
-    setTimeout(refreshHome, 3000);
+    setTimeout(refreshCurrent, 3000);
   } catch (e) { status('Resolve failed (season may not be over yet): ' + String(e.message).slice(0, 160), 9000); }
 }
 
-// ---------- routing ----------
-function goHome() { location.hash = '#/'; }
-function route() {
-  stopCoinChart();
-  const h = location.hash || '#/';
-  const coinMatch = h.match(/^#\/coin\/(\d+)$/);
-  const agentMatch = h.match(/^#\/agent\/(.+)$/);
-  if (coinMatch) showCoin(parseInt(coinMatch[1], 10));
-  else if (agentMatch) showAgent(decodeURIComponent(agentMatch[1]));
-  else {
-    $('view-coin').classList.add('hidden');
-    $('view-agent').classList.add('hidden');
-    $('view-home').classList.remove('hidden');
+// ---------- page routing ----------
+// Each page is a real page now (index, coin, agents, launch). The shared
+// script detects which page it is on by the containers present and
+// initialises only that page.
+let currentPage = 'home';
+let currentCoinId = null;
+let currentAgent = null;
+function refreshCurrent() {
+  if (currentPage === 'home') refreshHome();
+  else if (currentPage === 'coin' && currentCoinId !== null) showCoin(currentCoinId);
+  else if (currentPage === 'agents') { if (currentAgent) showAgent(currentAgent); else refreshAgents(); }
+  else if (currentPage === 'arena') refreshArena();
+}
+function toggleMenu() {
+  const nav = $('mobileNav');
+  if (nav) nav.classList.toggle('open');
+}
+function initPage() {
+  const params = new URLSearchParams(window.location.search);
+  if ($('coinDetail')) {
+    currentPage = 'coin';
+    const id = parseInt(params.get('coin') || '0', 10);
+    showCoin(Number.isNaN(id) ? 0 : id);
+  } else if ($('agentDetail')) {
+    currentPage = 'agents';
+    const acct = params.get('agent');
+    const lb = $('leaderboardSection');
+    const ap = $('agentSection');
+    if (acct) {
+      if (lb) lb.classList.add('hidden');
+      if (ap) ap.classList.remove('hidden');
+      showAgent(acct);
+    } else {
+      if (lb) lb.classList.remove('hidden');
+      if (ap) ap.classList.add('hidden');
+      refreshAgents();
+    }
+  } else if ($('arena-coins')) {
+    currentPage = 'arena';
+    refreshArena();
+  } else if ($('launchName')) {
+    currentPage = 'launch';
+  } else {
+    currentPage = 'home';
     refreshHome();
+    setInterval(() => { if (currentPage === 'home') refreshHome(); }, 20000);
   }
 }
-window.addEventListener('hashchange', route);
-initWallet().then(route);
-setInterval(() => { if (!$('view-home').classList.contains('hidden')) refreshHome(); }, 20000);
+initWallet().then(initPage);
