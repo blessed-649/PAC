@@ -331,9 +331,10 @@ async function renderWeeklyBoard() {
   try {
     const season = await view('get_current_season', {});
     const board = await view('get_season_leaderboard', { season_id: season.id });
+    const ranked = board.filter((r) => r.account !== ARENA_ID);
     const start = new Date(Number(BigInt(season.start_ns) / 1000000n));
     if (label) label.textContent = 'Season ' + season.id + ' · week of ' + start.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC). Prize pool ' + fmtNear(season.pool_yocto) + ' NEAR.';
-    body.innerHTML = board.length ? board.slice(0, 20).map((r, i) => `
+    body.innerHTML = ranked.length ? ranked.slice(0, 20).map((r, i) => `
       <tr onclick="location.href='agents.html?agent=${esc(r.account)}'">
         <td>${i + 1}</td><td>${esc(r.account)}</td>
         <td>${fmtNear(r.realised_pnl_yocto)} NEAR</td>
@@ -630,6 +631,9 @@ async function renderLeaderboard(coins, activity) {
   const ids = new Set();
   coins.forEach((c) => ids.add(c.creator));
   activity.forEach((e) => ids.add(e.agent));
+  // The arena records its own activity events (AI meme scoring), so it is
+  // not an agent and must not appear in the leaderboard.
+  ids.delete(ARENA_ID);
   const rows = [];
   for (const id of ids) {
     try { rows.push(await view('get_agent', { account: id })); } catch { /* skip */ }

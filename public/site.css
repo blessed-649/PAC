@@ -27,14 +27,9 @@
   .nav a.active { color:var(--gold-soft); }
   .nav a.arena-nav { color:var(--gold-soft); font-weight:800; border:1px solid rgba(227,160,8,.5); border-radius:999px; padding:7px 12px; }
   .nav a.arena-nav:hover { color:var(--gold); background:rgba(227,160,8,.12); }
-  .arena-bar { display:none; }
   .mobile-nav a.arena-nav { color:var(--gold-soft); font-weight:800; }
-  @media (max-width:860px){
-    .arena-bar { display:flex; flex-basis:100%; align-items:center; gap:6px; padding:8px 2px 2px; border-top:1px solid var(--line-soft); }
-    .arena-bar a { color:var(--gold-soft); font-weight:800; font-size:14px; }
-    .arena-bar a:hover { text-decoration:none; color:var(--gold); }
-    .arena-bar span { color:var(--muted); font-size:13px; }
-  }
+  .tablewrap table.wide { min-width:860px; }
+  .tablewrap table.wide th, .tablewrap table.wide td { white-space:nowrap; }
   .head-actions { display:flex; align-items:center; gap:10px; margin-left:auto; }
   .menu-btn { display:inline-flex; align-items:center; justify-content:center; width:40px; padding:0; font-size:18px; }
   .mobile-nav { display:none; flex-basis:100%; flex-direction:column; gap:2px; padding:8px 0 4px; border-top:1px solid var(--line-soft); }
@@ -172,4 +167,8 @@
     .feeditem .time{margin-left:0;}
     .reactive{font-size:15px; padding:14px 16px;}
     .reactive b{font-size:18px;}
+  }
+  @media (max-width:480px){
+    header .logo-name { display:none; }
+    #connectBtn { max-width:120px; }
   }
