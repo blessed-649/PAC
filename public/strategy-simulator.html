@@ -215,7 +215,7 @@
     <p class="kicker">Reputation</p>
     <h2>Reputation at day 30</h2>
     <div class="panel">
-      <p class="muted small">Scores use the real arena formula: realised PnL 40%, win rate 30%, average hold time 30%. Each part starts at 500 with no data, so a new agent with no trades scores 500. Only realised PnL counts; tokens still held do not count toward PnL until they are sold.</p>
+      <p class="muted small">Scores use the real arena formula: realised PnL 30%, win rate 20%, average hold time 15%, trade count 15%, drawdown 20%. Each part starts at 500 with no data, so a new agent with no trades scores 500. The PnL part only counts in full once the agent has spent 1 NEAR, and the win, hold and drawdown parts only count in full after 10 sells, so tiny trades and few trades cannot make a top score. Drawdown is the largest fall in realised PnL from its peak. Only realised PnL counts; tokens still held do not count toward PnL until they are sold.</p>
       <div id="repBox"><p class="muted">Run the simulation to see reputation.</p></div>
     </div>
   </section>
@@ -259,9 +259,13 @@
 // no onchain writes. The curve math below is an exact replay of the arena
 // contract pure helpers (price_per_token_yocto, buy_tokens_for_near,
 // sell_proceeds_yocto, fee_yocto), using BigInt throughout. The reputation
-// score is an exact replay of the contract compute_score: realised PnL 40%,
-// win rate 30%, average hold time 30%, each part 0 to 1000, each part 500
-// with no data, so a new agent scores 500.
+// score is an exact replay of the contract compute_score (v5): realised PnL
+// 30%, win rate 20%, average hold time 15%, trade count 15%, drawdown 20%,
+// each part 0 to 1000, each part 500 with no data, so a new agent scores 500.
+// The PnL part scales with volume deployed and the win, hold and drawdown
+// parts scale with trade count, so tiny trades and few trades cannot make
+// a top score. Drawdown is tracked per agent the same way the contract
+// tracks it: peak realised PnL and the largest fall from that peak.
 const NEAR = 10n ** 24n;
 const CURVE_CHUNK = 1000000n;
 const CURVE_BASE = 1000000000000000000n; // 1e18 yocto per whole token
@@ -279,9 +283,13 @@ const DAYS = 30;
 const START_BALANCE_YOCTO = 100n * NEAR; // paper NEAR per agent
 const DAY_NS = 86400n * 1000000000n;
 const HOLD_FULL_HOURS = 24;
-const REP_W_PNL = 40;
-const REP_W_WIN = 30;
-const REP_W_HOLD = 30;
+const VOLUME_FULL_YOCTO = NEAR; // 1 NEAR: the PnL part counts in full at this volume
+const COUNT_FULL = 10; // sells: the win, hold and drawdown parts count in full here
+const REP_W_PNL = 30;
+const REP_W_WIN = 20;
+const REP_W_HOLD = 15;
+const REP_W_COUNT = 15;
+const REP_W_DD = 20;
 const DEFAULTS = { agents: 120, tradesPerDay: 2, avgSizeNear: 1, holders: 50, traders: 30, snipers: 20, seed: 42 };
 
 const $ = (id) => document.getElementById(id);
@@ -356,35 +364,63 @@ function sellProceedsYocto(fromSold, tokens) {
 }
 function feeYocto(amount) { return amount * FEE_BP / 10000n; }
 
-// ---------- reputation (exact replay of the contract compute_score) ----------
-// BigInt division truncates toward zero, matching Rust i128 division.
+// ---------- reputation (exact replay of the contract compute_score, v5) ----------
+// BigInt division truncates toward zero, matching Rust integer division.
+// Number division below uses Math.trunc where the Rust side truncates.
+function volumeFactor(spentYocto) {
+  const s = spentYocto < VOLUME_FULL_YOCTO ? spentYocto : VOLUME_FULL_YOCTO;
+  return Number(s * 1000n / VOLUME_FULL_YOCTO); // 0 to 1000
+}
+function countFactor(sells) {
+  const s = Math.min(sells, COUNT_FULL);
+  return Math.floor((s * 1000) / COUNT_FULL); // 0 to 1000
+}
+function scaleTowardNeutral(raw, factor1000) {
+  // Factor 0 returns 500, factor 1000 returns the raw value.
+  return 500 + Math.trunc((raw - 500) * factor1000 / 1000);
+}
 function pnlComponent(spentYocto, receivedYocto) {
   if (spentYocto === 0n) return 500;
   const pnl = receivedYocto - spentYocto;
   let bp = pnl * 10000n / spentYocto;
   if (bp > 10000n) bp = 10000n;
   if (bp < -10000n) bp = -10000n;
-  let c = 500n + bp / 20n;
-  if (c < 0n) c = 0n;
-  if (c > 1000n) c = 1000n;
-  return Number(c);
+  let raw = 500n + bp / 20n;
+  if (raw < 0n) raw = 0n;
+  if (raw > 1000n) raw = 1000n;
+  return scaleTowardNeutral(Number(raw), volumeFactor(spentYocto));
 }
 function winComponent(sells, wins) {
   if (sells === 0) return 500;
-  return Math.floor((wins * 1000) / sells);
+  const raw = Math.floor((wins * 1000) / sells);
+  return scaleTowardNeutral(raw, countFactor(sells));
 }
 function holdComponent(totalNs, count) {
   if (count === 0) return 500;
   const avgHours = Number(totalNs / BigInt(count) / 3600000000000n);
-  return Math.min(Math.floor((avgHours * 1000) / HOLD_FULL_HOURS), 1000);
+  const raw = Math.min(Math.floor((avgHours * 1000) / HOLD_FULL_HOURS), 1000);
+  return scaleTowardNeutral(raw, countFactor(count));
+}
+function countComponent(sells) {
+  return 500 + Math.floor((500 * countFactor(sells)) / 1000);
+}
+function drawdownComponent(sells, maxDrawdownYocto, spentYocto) {
+  if (sells === 0) return 500;
+  const base = spentYocto > 1n ? spentYocto : 1n;
+  let ddBp = maxDrawdownYocto * 10000n / base;
+  if (ddBp > 10000n) ddBp = 10000n;
+  const raw = 1000 - Number(ddBp / 10n);
+  return scaleTowardNeutral(raw, countFactor(sells));
 }
 function computeScore(stats) {
   const pnl = pnlComponent(stats.totalSpentYocto, stats.totalReceivedYocto);
   const win = winComponent(stats.sells, stats.winningSells);
   const hold = holdComponent(stats.holdTimeTotalNs, stats.holdCount);
+  const count = countComponent(stats.sells);
+  const dd = drawdownComponent(stats.sells, stats.maxDrawdownYocto ?? 0n, stats.totalSpentYocto);
   // A rugged agent scores 0, whatever its parts say.
-  const score = stats.rugged ? 0 : Math.floor((REP_W_PNL * pnl + REP_W_WIN * win + REP_W_HOLD * hold) / 100);
-  return { score, pnl, win, hold };
+  const score = stats.rugged ? 0 : Math.floor((REP_W_PNL * pnl + REP_W_WIN * win + REP_W_HOLD * hold + REP_W_COUNT * count + REP_W_DD * dd) / 100);
+  return { score, pnl, win, hold, count, dd };
 }
 function scoreBand(score) {
   if (score < 300) return 'thin';
@@ -435,6 +471,8 @@ function runSimulation(cfg) {
     holdTimeTotalNs: 0n,
     holdCount: 0,
     realisedYocto: 0n,
+    peakRealisedYocto: 0n,
+    maxDrawdownYocto: 0n,
     rugged: false,
   }));
 
@@ -559,6 +597,11 @@ function runSimulation(cfg) {
           }
           agent.holdCount += 1;
           agent.realisedYocto += net - costOfSold;
+          // v5 drawdown tracking, same as the contract record_realised:
+          // peak realised PnL, then the largest fall from that peak.
+          if (agent.realisedYocto > agent.peakRealisedYocto) agent.peakRealisedYocto = agent.realisedYocto;
+          const dd = agent.peakRealisedYocto - agent.realisedYocto;
+          if (dd > agent.maxDrawdownYocto) agent.maxDrawdownYocto = dd;
           if (agent.tokens === 0n) agent.firstBuyNs = null;
           sold -= tokensToSell;
           trades++; sells++;
@@ -680,7 +723,7 @@ function renderAll(result) {
   const rb = $('repBox');
   const bc = result.bandCounts;
   const avgRow = (s) => (result.avgByStrategy[s] === null ? 'no agents' : result.avgByStrategy[s].toFixed(0));
-  const agentRow = (a) => `<tr><td>Agent ${a.id}</td><td>${a.strategy}</td><td><strong>${a.score}</strong><span class="band ${a.band}">${a.band}</span></td><td>${a.pnl}</td><td>${a.win}</td><td>${a.hold}</td><td class="${a.realisedYocto >= 0n ? 'pos' : 'neg'}">${a.realisedYocto >= 0n ? '+' : ''}${fmtNear(a.realisedYocto)} NEAR</td><td>${a.sells} sells, ${a.winningSells} wins</td></tr>`;
+  const agentRow = (a) => `<tr><td>Agent ${a.id}</td><td>${a.strategy}</td><td><strong>${a.score}</strong><span class="band ${a.band}">${a.band}</span></td><td>${a.pnl}</td><td>${a.win}</td><td>${a.hold}</td><td>${a.count}</td><td>${a.dd}</td><td class="${a.realisedYocto >= 0n ? 'pos' : 'neg'}">${a.realisedYocto >= 0n ? '+' : ''}${fmtNear(a.realisedYocto)} NEAR</td><td>${a.sells} sells, ${a.winningSells} wins</td></tr>`;
   rb.innerHTML = `
     <div class="kv" style="margin-bottom:14px;">
       <span>Strong (800 to 1000)</span><b>${bc.strong} agents</b>
@@ -692,9 +735,9 @@ function renderAll(result) {
       <span>Average score, snipers</span><b>${avgRow('sniper')}</b>
     </div>
     <h3>Top 5 agents</h3>
-    <div class="tablewrap"><table><thead><tr><th>Agent</th><th>Strategy</th><th>Score</th><th>PnL part</th><th>Win part</th><th>Hold part</th><th>Realised PnL</th><th>Sells</th></tr></thead><tbody>${result.top.map(agentRow).join('')}</tbody></table></div>
+    <div class="tablewrap"><table><thead><tr><th>Agent</th><th>Strategy</th><th>Score</th><th>PnL part</th><th>Win part</th><th>Hold part</th><th>Count part</th><th>Drawdown part</th><th>Realised PnL</th><th>Sells</th></tr></thead><tbody>${result.top.map(agentRow).join('')}</tbody></table></div>
     <h3>Bottom 5 agents</h3>
-    <div class="tablewrap"><table><thead><tr><th>Agent</th><th>Strategy</th><th>Score</th><th>PnL part</th><th>Win part</th><th>Hold part</th><th>Realised PnL</th><th>Sells</th></tr></thead><tbody>${result.bottom.map(agentRow).join('')}</tbody></table></div>`;
+    <div class="tablewrap"><table><thead><tr><th>Agent</th><th>Strategy</th><th>Score</th><th>PnL part</th><th>Win part</th><th>Hold part</th><th>Count part</th><th>Drawdown part</th><th>Realised PnL</th><th>Sells</th></tr></thead><tbody>${result.bottom.map(agentRow).join('')}</tbody></table></div>`;
   renderObservations(result);
 }
 
@@ -740,7 +783,7 @@ function renderObservations(result) {
   const best = ['holder', 'trader', 'sniper'].filter((s) => result.avgByStrategy[s] !== null)
     .sort((a, b) => result.avgByStrategy[b] - result.avgByStrategy[a]);
   if (best.length > 1) {
-    obs.push(`On reputation, ${best[0]}s averaged ${result.avgByStrategy[best[0]].toFixed(0)}, ahead of ${best[best.length - 1]}s at ${result.avgByStrategy[best[best.length - 1]].toFixed(0)}. Long holds lift the hold time part, and selling into a rising price lifts the realised PnL part. Agents who never sell score 0 on the PnL part, because tokens still held do not count until they are sold.`);
+    obs.push(`On reputation, ${best[0]}s averaged ${result.avgByStrategy[best[0]].toFixed(0)}, ahead of ${best[best.length - 1]}s at ${result.avgByStrategy[best[best.length - 1]].toFixed(0)}. Long holds lift the hold time part, and selling into a rising price lifts the realised PnL part. Agents with few trades cannot reach a top score, however good their other parts are, and a big fall from peak realised PnL drags the drawdown part down. Agents who never sell score low on the PnL part, because tokens still held do not count until they are sold.`);
   }
   $('obsBox').innerHTML = obs.map((o) => `<li>${esc(o)}</li>`).join('');
 }
@@ -795,7 +838,8 @@ function resetDefaults() {
 // full simulation, plus the last rendered result.
 window.__strategySim = {
   pricePerTokenYocto, buyTokensForNear, sellProceedsYocto, feeYocto,
-  pnlComponent, winComponent, holdComponent, computeScore, scoreBand,
+  pnlComponent, winComponent, holdComponent, countComponent, drawdownComponent,
+  volumeFactor, countFactor, scaleTowardNeutral, computeScore, scoreBand,
   runSimulation, mulberry32,
   state: () => ({ lastResult }),
 };
