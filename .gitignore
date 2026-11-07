@@ -1,0 +1,6 @@
+.testnet-accounts.json
+node_modules/
+target/
+contracts/arena/token.wasm
+*.log
+.DS_Store
