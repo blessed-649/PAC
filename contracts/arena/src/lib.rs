@@ -14,9 +14,9 @@
 //!      top score: the PnL part scales with volume deployed and the
 //!      win / hold / drawdown parts scale with trade count. A rug
 //!      zeroes the score.
-//!   4. Agent battles — two wallets stake a 0.1 NEAR forfeit, 24h window,
-//!      the contract compares realised PnL on the battle coin and pays the
-//!      winner automatically.
+//!   4. Agent battles — the two agents decide the stake (minimum 0.1 NEAR),
+//!      24h window, the contract compares realised PnL on the battle coin
+//!      and pays the winner automatically.
 //!   5. Holder milestones — at 10 QUALIFIED holders 1% of supply is
 //!      burned, at 50 a 50M-token treasury tranche joins the curve, at
 //!      100 holders a 1M-token airdrop opens (equal share, one claim
@@ -96,8 +96,10 @@ pub const CURVE_STEP_YOCTO: u128 = 1_000_000_000_000_000_000;
 pub const LOCK_DURATION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 /// Battle window, nanoseconds (24 hours).
 pub const BATTLE_DURATION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
-/// Battle forfeit, yoctoNEAR (0.1 NEAR per side).
-pub const BATTLE_FORFEIT_YOCTO: u128 = 100_000_000_000_000_000_000_000;
+/// Minimum battle stake, yoctoNEAR (0.1 NEAR). The challenger chooses the
+/// stake when creating a battle; the opponent must match it. There is no
+/// maximum — the two agents decide the amount freely above this floor.
+pub const BATTLE_MIN_STAKE_YOCTO: u128 = 100_000_000_000_000_000_000_000;
 /// NEAR attached to a launch to fund the new coin sub-account and its
 /// token contract storage (2 NEAR).
 pub const LAUNCH_COST_YOCTO: u128 = 2_000_000_000_000_000_000_000_000;
@@ -536,7 +538,7 @@ pub struct ParamsView {
     pub lock_duration_hours: u64,
     pub battle_duration_ns: u64,
     pub battle_duration_hours: u64,
-    pub battle_forfeit_yocto: String,
+    pub battle_min_stake_yocto: String,
     pub launch_cost_yocto: String,
     pub min_initial_buy_yocto: String,
     pub rep_weight_pnl: u64,
@@ -588,7 +590,7 @@ pub struct ParamsView {
     pub season_duration_ns: u64,
     pub season_duration_days: u64,
     pub season_top_shares_bp: Vec<u128>,
-    /// Contract schema version (v6). Lets anyone confirm which
+    /// Contract schema version (v7). Lets anyone confirm which
     /// contract code is live without reading the WASM.
     pub schema_version: u32,
 }
@@ -1185,24 +1187,24 @@ pub struct Contract {
     /// AgentStats map deserialises unchanged. Starts empty at v5.
     agent_rep: LookupMap<AccountId, AgentRep>,
     // --- v6 field (appended after the v5 fields) ---
-    /// Contract schema version. Set to 6 by new() and by migrate().
-    /// It makes migrate() one-shot: the v6 state carries this field,
-    /// so a second migrate() (which reads state as the v5 OldContract,
-    /// without this field) fails on the trailing Borsh bytes instead
-    /// of silently re-copying the state. Without it, the second
-    /// migrate() would succeed as a no-op, because the v6 layout is
-    /// otherwise identical to v5.
+    /// Contract schema version. Set to 7 by new() and by migrate().
+    /// migrate() requires the old state's schema_version to be 6,
+    /// so a second migrate() on v7 state (schema_version 7) panics
+    /// instead of silently re-copying the state. (The Borsh
+    /// trailing-bytes guard from v6 does not apply here, because the
+    /// v6 and v7 layouts are identical — both carry this field — so
+    /// the explicit version check in migrate() is what makes it
+    /// one-shot.)
     schema_version: u32,
 }
 
-/// The v5 coin record, kept verbatim so migrate() can deserialise the
-/// live v5 coin bytes. Field order and types must match the v5 Coin
-/// exactly; do not edit. The v5 Coin adds qualified_holders (before
-/// image_url), so the v4 bytes cannot deserialise as a v5 Coin. The
-/// v6 Coin is identical to the v5 Coin, so migrate() copies each coin
-/// field for field, including its stored qualified holder count.
+/// The v6 coin record, kept verbatim so migrate() can deserialise the
+/// live v6 coin bytes. Field order and types must match the v6 Coin
+/// exactly; do not edit. The v6 Coin is identical to the v5 Coin, so
+/// migrate() copies each coin field for field, including its stored
+/// qualified holder count.
 /// BorshSerialize is derived so the LookupMap type bounds hold; its
-/// bytes are identical to the v5 Coin.
+/// bytes are identical to the v6 Coin.
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct OldCoin {
     pub id: u64,
@@ -1231,13 +1233,14 @@ pub struct OldCoin {
     pub image_url: Option<String>,
 }
 
-/// The v5 contract state, kept verbatim so migrate() can deserialise
-/// the live v5 bytes and rebuild the v6 state from them. Field order
-/// and types must match the v5 Contract exactly; do not edit. The
-/// coins map holds OldCoin records (see above) because the v5 Coin
-/// adds qualified_holders. The v5 Contract adds agent_rep at the end.
-/// The v6 Contract is identical to the v5 Contract, so migrate() is
-/// a straight copy of every field and collection.
+/// The v6 contract state, kept verbatim so migrate() can deserialise
+/// the live v6 bytes and rebuild the v7 state from them. Field order
+/// and types must match the v6 Contract exactly; do not edit. The
+/// coins map holds OldCoin records (see above) because the v6 Coin
+/// adds qualified_holders. The v6 Contract adds agent_rep at the end,
+/// then schema_version. The v7 Contract is identical to the v6
+/// Contract, so migrate() is a straight copy of every field and
+/// collection.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -1261,14 +1264,18 @@ pub struct OldContract {
     seasons: LookupMap<u64, Season>,
     season_pnl: LookupMap<String, i128>,
     /// "coin_id:day:submission_index" -> the meme text the AI judge
-    /// reads (v5 field; same position as in the v5 Contract).
+    /// reads (v6 field; same position as in the v6 Contract).
     meme_texts: LookupMap<String, String>,
     /// "coin_id:day:submission_index" -> the NEAR AI judge's score
-    /// (v5 field; same position as in the v5 Contract).
+    /// (v6 field; same position as in the v6 Contract).
     ai_scores: LookupMap<String, AiScore>,
-    /// Per-agent reputation extension (v5): realised PnL, peak, max
-    /// drawdown (same position as in the v5 Contract).
+    /// Per-agent reputation extension (v6): realised PnL, peak, max
+    /// drawdown (same position as in the v6 Contract).
     agent_rep: LookupMap<AccountId, AgentRep>,
+    /// Contract schema version (v6 field; same position as in the v6
+    /// Contract). migrate() requires this to be 6, so a second
+    /// migrate() on v7 state (schema_version 7) is rejected.
+    schema_version: u32,
 }
 
 #[near]
@@ -1299,34 +1306,44 @@ impl Contract {
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
-            schema_version: 6,
+            schema_version: 7,
         }
     }
 
-    /// Migrate the live v5 state to v6 without wiping it. Deploy the
-    /// v6 WASM over the v5 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v5 field and collection
+    /// Migrate the live v6 state to v7 without wiping it. Deploy the
+    /// v7 WASM over the v6 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v6 field and collection
     /// verbatim (agents, positions, battles, vote rounds, coin duels,
     /// meme days, meme texts, AI scores, activity, prize pool, follows,
     /// copy positions, seasons, agent_rep), and rebuilds each coin as
-    /// a v6 Coin field for field, including its stored qualified
-    /// holder count. The v6 Coin and Contract are identical to the v5
-    /// layouts, so this is a straight copy; the only code change in v6
-    /// is the audit fixes (logic only, no state-layout change). Coin
-    /// ids are sequential from 0, so the rebuild walks 0..coin_count
-    /// and skips ids with no stored coin (a failed launch leaves a
-    /// gap). The new coins map reuses the same storage prefix, so each
+    /// a v7 Coin field for field, including its stored qualified
+    /// holder count. The v7 Coin and Contract are identical to the v6
+    /// layouts, so this is a straight copy; the only code change in v7
+    /// is the battle stake model (fixed 0.1 NEAR forfeit -> the two
+    /// agents decide the stake, minimum 0.1 NEAR; logic only, no
+    /// state-layout change). Existing battles keep their stored 0.1
+    /// NEAR stake; only new battles use the agents-decide model. Coin ids are
+    /// sequential from 0, so the rebuild walks 0..coin_count and
+    /// skips ids with no stored coin (a failed launch leaves a gap).
+    /// The new coins map reuses the same storage prefix, so each
     /// converted coin overwrites its old bytes at the same key. NOTE:
     /// set(), not insert(). insert() loads the previous value at the
     /// key so it can return it; set() only marks the cache entry
-    /// modified, so the v6 bytes overwrite the v5 bytes at the same
-    /// key on flush. Calling migrate() twice fails: after the first
-    /// call the stored state is v6, which no longer deserialises as
-    /// v5 (the v6 code is deployed, so the second call runs the v6
-    /// migrate() against v6 state and the OldContract read fails).
+    /// modified, so the v7 bytes overwrite the v6 bytes at the same
+    /// key on flush. Calling migrate() twice fails: migrate() requires
+    /// the old state's schema_version to be 6, and after the first
+    /// call the stored state is v7 (schema_version 7), so the second
+    /// call panics. (The Borsh trailing-bytes guard from v6 does not
+    /// apply here, because the v6 and v7 layouts are identical — both
+    /// carry schema_version — so the explicit version check is what
+    /// makes migrate() one-shot.)
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v5 state to migrate");
+        let old: OldContract = env::state_read().expect("no v6 state to migrate");
+        assert_eq!(
+            old.schema_version, 6,
+            "migrate() only runs on v6 state (schema_version 6); this state is already v7 or another version"
+        );
         let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
         for id in 0..old.coin_count {
             if let Some(oc) = old.coins.get(&id).cloned() {
@@ -1382,7 +1399,7 @@ impl Contract {
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
             agent_rep: old.agent_rep,
-            schema_version: 6,
+            schema_version: 7,
         }
     }
 
@@ -2052,17 +2069,19 @@ impl Contract {
 
     // -- battles -----------------------------------------------------------
 
-    /// Challenge `opponent` to a battle on `coin_id`. Attach exactly the
-    /// 0.1 NEAR forfeit. The battle waits for the opponent to accept.
+    /// Challenge `opponent` to a battle on `coin_id`. Attach the stake you
+    /// want to play for (at least the 0.1 NEAR minimum). That amount becomes
+    /// the battle's stake; the opponent must match it to accept. The battle
+    /// waits for the opponent to accept.
     #[payable]
     pub fn create_battle(&mut self, coin_id: u64, opponent: AccountId) -> u64 {
         let challenger = env::predecessor_account_id();
         assert!(self.coins.get(&coin_id).is_some(), "coin not found");
         assert_ne!(challenger, opponent, "cannot battle yourself");
-        assert_eq!(
-            env::attached_deposit().as_yoctonear(),
-            BATTLE_FORFEIT_YOCTO,
-            "attach exactly the 0.1 NEAR forfeit"
+        let stake = env::attached_deposit().as_yoctonear();
+        assert!(
+            stake >= BATTLE_MIN_STAKE_YOCTO,
+            "battle stake must be at least 0.1 NEAR"
         );
         let id = self.battle_count;
         self.battle_count += 1;
@@ -2073,7 +2092,7 @@ impl Contract {
                 coin_id,
                 agent_a: challenger.clone(),
                 agent_b: opponent,
-                forfeit_yocto: BATTLE_FORFEIT_YOCTO,
+                forfeit_yocto: stake,
                 status: 0,
                 created_at_ns: env::block_timestamp(),
                 start_ns: 0,
@@ -2088,15 +2107,15 @@ impl Contract {
             challenger,
             coin_id,
             0,
-            BATTLE_FORFEIT_YOCTO,
+            stake,
             format!("battle {} created", id),
         );
         id
     }
 
-    /// Accept a pending battle. Attach exactly the 0.1 NEAR forfeit. The
-    /// 24h window starts now and both agents' realised PnL on the battle
-    /// coin is snapshotted.
+    /// Accept a pending battle. Attach exactly the battle's stake (the
+    /// amount the challenger staked). The 24h window starts now and both
+    /// agents' realised PnL on the battle coin is snapshotted.
     #[payable]
     pub fn accept_battle(&mut self, battle_id: u64) {
         let caller = env::predecessor_account_id();
@@ -2105,8 +2124,8 @@ impl Contract {
         assert_eq!(caller, battle.agent_b, "only the challenged agent accepts");
         assert_eq!(
             env::attached_deposit().as_yoctonear(),
-            BATTLE_FORFEIT_YOCTO,
-            "attach exactly the 0.1 NEAR forfeit"
+            battle.forfeit_yocto,
+            "attach exactly the battle's stake"
         );
         let now = env::block_timestamp();
         battle.status = 1;
@@ -2120,7 +2139,7 @@ impl Contract {
             caller,
             battle.coin_id,
             0,
-            BATTLE_FORFEIT_YOCTO,
+            battle.forfeit_yocto,
             format!("battle {} accepted, 24h window started", battle_id),
         );
     }
@@ -2128,8 +2147,8 @@ impl Contract {
     /// Cancel a pending battle the opponent never accepted. Only the
     /// challenger can cancel, only while the battle is still pending.
     /// Without this, a challenger whose opponent never accepts loses
-    /// the 0.1 NEAR forfeit forever — there was no way to get it back.
-    /// The forfeit is refunded and the battle is marked cancelled;
+    /// the stake forever — there was no way to get it back.
+    /// The stake is refunded and the battle is marked cancelled;
     /// it can no longer be accepted or resolved.
     pub fn cancel_battle(&mut self, battle_id: u64) {
         let caller = env::predecessor_account_id();
@@ -2146,12 +2165,12 @@ impl Contract {
             battle.coin_id,
             0,
             battle.forfeit_yocto,
-            format!("battle {} cancelled, forfeit refunded", battle_id),
+            format!("battle {} cancelled, stake refunded", battle_id),
         );
     }
 
     /// Resolve an active battle after its 24h window. Anyone can call it.
-    /// Winner takes both forfeits; a tie refunds each side.
+    /// Winner takes both stakes; a tie refunds each side.
     pub fn resolve_battle(&mut self, battle_id: u64) {
         let mut battle = self.battles.get(&battle_id).expect("battle not found").clone();
         assert_eq!(battle.status, 1, "battle not active");
@@ -3233,7 +3252,7 @@ impl Contract {
             lock_duration_hours: 24,
             battle_duration_ns: BATTLE_DURATION_NS,
             battle_duration_hours: 24,
-            battle_forfeit_yocto: BATTLE_FORFEIT_YOCTO.to_string(),
+            battle_min_stake_yocto: BATTLE_MIN_STAKE_YOCTO.to_string(),
             launch_cost_yocto: LAUNCH_COST_YOCTO.to_string(),
             min_initial_buy_yocto: MIN_INITIAL_BUY_YOCTO.to_string(),
             rep_weight_pnl: REP_W_PNL,
@@ -4616,7 +4635,7 @@ mod tests {
     #[test]
     fn audit_pending_battle_can_be_cancelled() {
         // LOW: a challenger whose opponent never accepted had no way
-        // to recover the 0.1 NEAR forfeit. cancel_battle refunds it
+        // to recover the stake. cancel_battle refunds it
         // and marks the battle cancelled so it cannot be accepted or
         // resolved afterwards.
         let mut c = Contract::new();
@@ -4624,7 +4643,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
-        testing_env!(audit_ctx("alice.testnet", BATTLE_FORFEIT_YOCTO).build());
+        testing_env!(audit_ctx("alice.testnet", 2_000_000_000_000_000_000_000_000u128).build());
         let id = c.create_battle(0, opponent);
         assert_eq!(id, 0);
         assert_eq!(c.battles.get(&0).unwrap().status, 0);
@@ -4642,11 +4661,163 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
-        testing_env!(audit_ctx("alice.testnet", BATTLE_FORFEIT_YOCTO).build());
+        testing_env!(audit_ctx("alice.testnet", 2_000_000_000_000_000_000_000_000u128).build());
         c.create_battle(0, opponent);
         // The challenged opponent (or anyone else) cannot cancel.
         testing_env!(audit_ctx("bob.testnet", 0).build());
         c.cancel_battle(0);
+    }
+
+    // --- v7: the two agents decide the battle stake (minimum 0.1 NEAR) ---
+
+    #[test]
+    fn v7_battle_min_stake_is_tenth_near() {
+        assert_eq!(
+            BATTLE_MIN_STAKE_YOCTO,
+            100_000_000_000_000_000_000_000u128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "battle stake must be at least 0.1 NEAR")]
+    fn v7_create_battle_rejects_below_minimum() {
+        // A stake below the 0.1 NEAR floor is rejected.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            50_000_000_000_000_000_000_000u128, // 0.05 NEAR
+        )
+        .build());
+        c.create_battle(0, opponent);
+    }
+
+    #[test]
+    fn v7_create_battle_records_chosen_stake() {
+        // The challenger chooses the stake; it is recorded on the battle.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        let id = c.create_battle(0, opponent);
+        assert_eq!(
+            c.battles.get(&id).unwrap().forfeit_yocto,
+            2_000_000_000_000_000_000_000_000u128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attach exactly the battle's stake")]
+    fn v7_accept_battle_rejects_wrong_amount() {
+        // The opponent must match the challenger's stake exactly.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        let id = c.create_battle(0, opponent);
+        testing_env!(audit_ctx(
+            "bob.testnet",
+            100_000_000_000_000_000_000_000u128, // 0.1 NEAR — not the 2 NEAR stake
+        )
+        .build());
+        c.accept_battle(id);
+    }
+
+    #[test]
+    fn v7_battle_flow_works_with_chosen_stake() {
+        // Create + accept with a 2 NEAR chosen stake; the battle becomes active.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        let id = c.create_battle(0, opponent);
+        assert_eq!(
+            c.battles.get(&id).unwrap().forfeit_yocto,
+            2_000_000_000_000_000_000_000_000u128
+        );
+        testing_env!(audit_ctx(
+            "bob.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        c.accept_battle(id);
+        assert_eq!(c.battles.get(&id).unwrap().status, 1);
+        assert_eq!(
+            c.battles.get(&id).unwrap().forfeit_yocto,
+            2_000_000_000_000_000_000_000_000u128
+        );
+    }
+
+    #[test]
+    fn v7_battle_winner_takes_both_stakes() {
+        // The winner takes both stakes (2x the agreed 2 NEAR stake).
+        // The transfer itself is a Promise the runtime executes; the
+        // unit test proves the winner is recorded and the battle is
+        // resolved with the chosen stake.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        let id = c.create_battle(0, opponent);
+        testing_env!(audit_ctx(
+            "bob.testnet",
+            2_000_000_000_000_000_000_000_000u128, // 2 NEAR
+        )
+        .build());
+        c.accept_battle(id);
+        // Give the challenger a positive realised PnL on the battle coin.
+        c.positions.insert(
+            "alice.testnet:0".to_string(),
+            Position {
+                bought_tokens: 0,
+                spent_yocto: 0,
+                first_buy_ns: 0,
+                realised_yocto: 1_000_000_000_000_000_000_000_000i128, // +1 NEAR
+            },
+        );
+        // Move past the 24h window, then resolve.
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("alice.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(2_000_000_000_000_000_000);
+        testing_env!(b.build());
+        c.resolve_battle(id);
+        let battle = c.battles.get(&id).unwrap();
+        assert_eq!(battle.status, 2);
+        assert_eq!(battle.winner, Some(challenger.clone()));
+        assert_eq!(
+            battle.forfeit_yocto,
+            2_000_000_000_000_000_000_000_000u128
+        );
+        assert_eq!(c.get_agent_stats(&challenger).battles_won, 1);
     }
 
 }
