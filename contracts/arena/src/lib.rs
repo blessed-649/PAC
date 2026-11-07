@@ -50,7 +50,9 @@
 //! yield stays v2, not built. Copy and weekly seasons shipped in v2.
 //! The AI meme judge shipped in v3: NEAR AI scores each meme on humor,
 //! originality and relevance, and the daily winner is AI 50% plus
-//! community vote 50%.
+//! community vote 50%. Coin images shipped in v4: each coin carries an
+//! optional image URL onchain (set at launch or later by its creator),
+//! and the site shows a live price chart per coin.
 
 use near_contract_standards::fungible_token::metadata::FungibleTokenMetadata;
 use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
@@ -140,6 +142,9 @@ pub const MEME_MIN_RESERVE_YOCTO: u128 = 50_000_000_000_000_000_000_000;
 /// Max meme text length (chars) the AI judge reads. The text is public:
 /// a meme is meant to be seen, so it is stored onchain in the clear.
 pub const MEME_TEXT_MAX_CHARS: usize = 500;
+
+/// Max length of a coin image URL (chars, v4).
+pub const IMAGE_URL_MAX_CHARS: usize = 500;
 /// AI judge weights for the daily winner: the AI score and the community
 /// vote each count 50% (basis points, so 5000 = 50%).
 pub const AI_WEIGHT_BP: u128 = 5000;
@@ -223,6 +228,10 @@ pub struct Coin {
     /// Accounts that already claimed the airdrop.
     pub airdrop_claimed: Vec<AccountId>,
     pub holders: Vec<AccountId>,
+    /// Optional image URL for the coin (v4). Set at launch or later by
+    /// the creator with set_coin_image. Coins minted before v4 read
+    /// back as None; the v4 migrate() rebuilds them with None.
+    pub image_url: Option<String>,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Default)]
@@ -474,6 +483,8 @@ pub struct ParamsView {
     pub community_weight_bp: u128,
     /// Max meme text length in chars.
     pub meme_text_max_chars: u64,
+    /// Max coin image URL length in chars (v4).
+    pub image_url_max_chars: u64,
     pub trading_fee_bp: u128,
     pub copy_fee_bp: u128,
     pub copy_min_per_trade_yocto: String,
@@ -507,6 +518,8 @@ pub struct CoinView {
     pub burned_tokens: String,
     pub milestones_fired: Vec<u64>,
     pub airdrop_per_holder: String,
+    /// Image URL for the coin (v4), null when the coin has no image.
+    pub image_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -843,6 +856,19 @@ pub fn combined_meme_score(ai_total: u64, votes: u64, max_votes: u64) -> u128 {
     ai_part + community_part
 }
 
+/// A coin image URL is either absent (no image, the site draws its
+/// generated symbol art) or an http(s) URL within the length limit.
+/// Used by launch_coin and set_coin_image.
+pub fn image_url_valid(image_url: &Option<String>) -> bool {
+    match image_url {
+        None => true,
+        Some(url) => {
+            url.len() <= IMAGE_URL_MAX_CHARS
+                && (url.starts_with("http://") || url.starts_with("https://"))
+        }
+    }
+}
+
 /// Season id for a block timestamp (nanoseconds). Seasons are 7-day
 /// windows on the Monday 00:00 UTC grid anchored at 1970-01-05.
 pub fn season_id_for(timestamp_ns: u64) -> u64 {
@@ -904,6 +930,7 @@ pub trait ExtSelf {
         name: String,
         symbol: String,
         description: String,
+        image_url: Option<String>,
         cost_yocto: U128,
         tokens: U128,
         attached_yocto: U128,
@@ -977,9 +1004,43 @@ pub struct Contract {
     ai_scores: LookupMap<String, AiScore>,
 }
 
-/// The v2 contract state, kept verbatim so migrate() can deserialise
-/// the live v2 bytes and rebuild the v3 state from them. Field order
-/// and types must match the v2 Contract exactly; do not edit.
+/// The v3 coin record, kept verbatim so migrate() can deserialise the
+/// live v3 coin bytes. Field order and types must match the v3 Coin
+/// exactly; do not edit. The v4 Coin adds image_url at the end, so the
+/// v3 bytes cannot deserialise as a v4 Coin and migrate() rebuilds each
+/// coin with image_url None instead. BorshSerialize is derived so the
+/// LookupMap type bounds hold; its bytes are identical to the v3 Coin.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct OldCoin {
+    pub id: u64,
+    pub token_id: AccountId,
+    pub name: String,
+    pub symbol: String,
+    pub description: String,
+    pub creator: AccountId,
+    pub created_at_ns: u64,
+    pub sold_tokens: u128,
+    pub locked_tokens: u128,
+    pub initial_buy_tokens: u128,
+    pub unlock_at_ns: u64,
+    pub creator_sold_after_unlock: u128,
+    pub near_reserve_yocto: u128,
+    pub total_spent_yocto: u128,
+    pub total_received_yocto: u128,
+    pub total_supply_tokens: u128,
+    pub curve_cap_tokens: u128,
+    pub burned_tokens: u128,
+    pub milestones_fired: Vec<u64>,
+    pub airdrop_per_holder: u128,
+    pub airdrop_claimed: Vec<AccountId>,
+    pub holders: Vec<AccountId>,
+}
+
+/// The v3 contract state, kept verbatim so migrate() can deserialise
+/// the live v3 bytes and rebuild the v4 state from them. Field order
+/// and types must match the v3 Contract exactly; do not edit. The
+/// coins map holds OldCoin records (see above) because the v4 Coin
+/// adds image_url and the v3 coin bytes cannot deserialise as v4 Coins.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -987,7 +1048,7 @@ pub struct OldContract {
     agent_count: u64,
     vote_round_count: u64,
     coin_duel_count: u64,
-    coins: LookupMap<u64, Coin>,
+    coins: LookupMap<u64, OldCoin>,
     token_to_coin: LookupMap<AccountId, u64>,
     agents: LookupMap<AccountId, AgentStats>,
     positions: LookupMap<String, Position>,
@@ -1002,6 +1063,12 @@ pub struct OldContract {
     copy_positions: LookupMap<String, CopyPosition>,
     seasons: LookupMap<u64, Season>,
     season_pnl: LookupMap<String, i128>,
+    /// "coin_id:day:submission_index" -> the meme text the AI judge
+    /// reads (v3 field; same position as in the v3 Contract).
+    meme_texts: LookupMap<String, String>,
+    /// "coin_id:day:submission_index" -> the NEAR AI judge's score
+    /// (v3 field; same position as in the v3 Contract).
+    ai_scores: LookupMap<String, AiScore>,
 }
 
 #[near]
@@ -1034,25 +1101,68 @@ impl Contract {
         }
     }
 
-    /// Migrate the live v2 state to v3 without wiping it. Deploy the
-    /// v3 WASM over the v2 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v2 field and collection
-    /// verbatim (coins, agents, positions, battles, vote rounds, coin
-    /// duels, meme days, activity, prize pool, follows, copy positions,
-    /// seasons), and starts the v3 collections (meme texts, AI scores)
-    /// empty on fresh prefixes that do not collide with the v1/v2 ones.
-    /// Calling migrate() twice fails: after the first call the stored
-    /// state is v3, which no longer deserialises as v2.
+    /// Migrate the live v3 state to v4 without wiping it. Deploy the
+    /// v4 WASM over the v3 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v3 field and collection
+    /// verbatim (agents, positions, battles, vote rounds, coin duels,
+    /// meme days, meme texts, AI scores, activity, prize pool, follows,
+    /// copy positions, seasons), and rebuilds each coin as a v4 Coin
+    /// with image_url None: the v3 coin Borsh bytes carry no image_url
+    /// field, so they cannot deserialise as v4 Coins. Coin ids are
+    /// sequential from 0, so the rebuild walks 0..coin_count and skips
+    /// ids with no stored coin (a failed launch leaves a gap). The new
+    /// coins map reuses the same storage prefix, so each converted coin
+    /// overwrites its old bytes at the same key. No new collections are
+    /// needed: the image lives on the coin itself. Calling migrate()
+    /// twice fails: after the first call the stored state is v4, which
+    /// no longer deserialises as v3.
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v2 state to migrate");
+        let old: OldContract = env::state_read().expect("no v3 state to migrate");
+        let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
+        for id in 0..old.coin_count {
+            if let Some(oc) = old.coins.get(&id).cloned() {
+                // NOTE: set(), not insert(). insert() loads the previous
+                // value at the key so it can return it, and the stored
+                // value here is still v3 coin bytes, which cannot
+                // deserialise as a v4 Coin (no image_url field) and
+                // would panic with "Cannot deserialize element". set()
+                // only marks the cache entry modified, so the v4 bytes
+                // overwrite the v3 bytes at the same key on flush.
+                coins.set(id, Some(Coin {
+                    id: oc.id,
+                    token_id: oc.token_id,
+                    name: oc.name,
+                    symbol: oc.symbol,
+                    description: oc.description,
+                    creator: oc.creator,
+                    created_at_ns: oc.created_at_ns,
+                    sold_tokens: oc.sold_tokens,
+                    locked_tokens: oc.locked_tokens,
+                    initial_buy_tokens: oc.initial_buy_tokens,
+                    unlock_at_ns: oc.unlock_at_ns,
+                    creator_sold_after_unlock: oc.creator_sold_after_unlock,
+                    near_reserve_yocto: oc.near_reserve_yocto,
+                    total_spent_yocto: oc.total_spent_yocto,
+                    total_received_yocto: oc.total_received_yocto,
+                    total_supply_tokens: oc.total_supply_tokens,
+                    curve_cap_tokens: oc.curve_cap_tokens,
+                    burned_tokens: oc.burned_tokens,
+                    milestones_fired: oc.milestones_fired,
+                    airdrop_per_holder: oc.airdrop_per_holder,
+                    airdrop_claimed: oc.airdrop_claimed,
+                    holders: oc.holders,
+                    image_url: None,
+                }));
+            }
+        }
         Self {
             coin_count: old.coin_count,
             battle_count: old.battle_count,
             agent_count: old.agent_count,
             vote_round_count: old.vote_round_count,
             coin_duel_count: old.coin_duel_count,
-            coins: old.coins,
+            coins,
             token_to_coin: old.token_to_coin,
             agents: old.agents,
             positions: old.positions,
@@ -1067,8 +1177,8 @@ impl Contract {
             copy_positions: old.copy_positions,
             seasons: old.seasons,
             season_pnl: old.season_pnl,
-            meme_texts: LookupMap::new(b"x"),
-            ai_scores: LookupMap::new(b"j"),
+            meme_texts: old.meme_texts,
+            ai_scores: old.ai_scores,
         }
     }
 
@@ -1137,6 +1247,7 @@ impl Contract {
             burned_tokens: coin.burned_tokens.to_string(),
             milestones_fired: coin.milestones_fired.clone(),
             airdrop_per_holder: coin.airdrop_per_holder.to_string(),
+            image_url: coin.image_url.clone(),
         }
     }
 
@@ -1178,7 +1289,9 @@ impl Contract {
     /// new coin sub-account and its token contract storage; the initial buy
     /// goes into the bonding curve and its tokens are locked 24h, held by
     /// this contract. Returns the reserved coin id; the coin record appears
-    /// once the token contract deploys (check `get_coin`).
+    /// once the token contract deploys (check `get_coin`). `image_url` is
+    /// optional (v4): an http(s) URL, max 500 chars, stored on the coin
+    /// and shown on its card; None keeps the generated symbol art.
     #[payable]
     pub fn launch_coin(
         &mut self,
@@ -1186,6 +1299,7 @@ impl Contract {
         symbol: String,
         description: String,
         initial_buy_yocto: U128,
+        image_url: Option<String>,
     ) -> u64 {
         let creator = env::predecessor_account_id();
         let attached = env::attached_deposit().as_yoctonear();
@@ -1194,6 +1308,10 @@ impl Contract {
         assert!(
             symbol.chars().all(|c| c.is_ascii_alphanumeric()),
             "symbol must be alphanumeric"
+        );
+        assert!(
+            image_url_valid(&image_url),
+            "image_url must be an http(s) URL of at most 500 chars"
         );
         assert!(
             initial_buy_yocto.0 >= MIN_INITIAL_BUY_YOCTO,
@@ -1244,6 +1362,7 @@ impl Contract {
                         name,
                         symbol,
                         description,
+                        image_url,
                         U128(cost),
                         U128(tokens),
                         U128(attached),
@@ -1262,6 +1381,7 @@ impl Contract {
         name: String,
         symbol: String,
         description: String,
+        image_url: Option<String>,
         cost_yocto: U128,
         tokens: U128,
         attached_yocto: U128,
@@ -1300,6 +1420,7 @@ impl Contract {
                     airdrop_per_holder: 0,
                     airdrop_claimed: vec![],
                     holders: vec![creator.clone()],
+                    image_url,
                 };
                 self.coins.insert(coin_id, coin);
                 self.token_to_coin.insert(token_id, coin_id);
@@ -1334,6 +1455,22 @@ impl Contract {
                 false
             }
         }
+    }
+
+    /// Set (or clear, with None) a coin's image URL. Only that coin's
+    /// creator can call it. The URL must be an http(s) URL of at most
+    /// 500 chars when present. Lets coins minted before v4, and coins
+    /// launched without an image, get one later.
+    pub fn set_coin_image(&mut self, coin_id: u64, image_url: Option<String>) {
+        let caller = env::predecessor_account_id();
+        let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
+        assert_eq!(coin.creator, caller, "only the coin creator can set its image");
+        assert!(
+            image_url_valid(&image_url),
+            "image_url must be an http(s) URL of at most 500 chars"
+        );
+        coin.image_url = image_url;
+        self.coins.insert(coin_id, coin);
     }
 
     // -- buy ---------------------------------------------------------------
@@ -2799,6 +2936,7 @@ impl Contract {
             ai_weight_bp: AI_WEIGHT_BP,
             community_weight_bp: COMMUNITY_WEIGHT_BP,
             meme_text_max_chars: MEME_TEXT_MAX_CHARS as u64,
+            image_url_max_chars: IMAGE_URL_MAX_CHARS as u64,
             trading_fee_bp: TRADING_FEE_BP,
             copy_fee_bp: COPY_FEE_BP,
             copy_min_per_trade_yocto: COPY_MIN_PER_TRADE_YOCTO.to_string(),
@@ -3637,4 +3775,26 @@ mod tests {
         assert_eq!(AI_WEIGHT_BP + COMMUNITY_WEIGHT_BP, 10_000);
         assert_eq!(MEME_TEXT_MAX_CHARS, 500);
     }
+
+    #[test]
+    fn coin_image_url_validation() {
+        // No image is always fine (the site draws generated symbol art).
+        assert!(image_url_valid(&None));
+        // http and https URLs within the limit are fine.
+        assert!(image_url_valid(&Some("https://example.com/coin.png".to_string())));
+        assert!(image_url_valid(&Some("http://example.com/coin.png".to_string())));
+        assert_eq!(IMAGE_URL_MAX_CHARS, 500);
+        // Anything that is not an http(s) URL is rejected.
+        assert!(!image_url_valid(&Some("ftp://example.com/coin.png".to_string())));
+        assert!(!image_url_valid(&Some("ipfs://QmHash".to_string())));
+        assert!(!image_url_valid(&Some("".to_string())));
+        assert!(!image_url_valid(&Some("example.com/coin.png".to_string())));
+        // Over the length limit is rejected, at the limit is fine.
+        let long = format!("https://example.com/{}", "a".repeat(500));
+        assert!(!image_url_valid(&Some(long)));
+        let at_limit = format!("https://example.com/{}", "a".repeat(500 - 20));
+        assert_eq!(at_limit.len(), 500);
+        assert!(image_url_valid(&Some(at_limit)));
+    }
+
 }

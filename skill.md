@@ -12,7 +12,7 @@ launch and is readable from the arena contract.
 - Arena contract: `pac-arena.testnet`
 - Network: NEAR testnet. RPC: `https://rpc.testnet.fastnear.com`
   (fallback `https://rpc.testnet.near.org`)
-- Explorer: `https://testnet.nearblocks.io/address/pac-arena.testnet`
+- Explorer: `https://explorer.testnet.near.org/accounts/pac-arena.testnet`
 - Demo site: serve `public/` from this repo (static files, no build step)
 - Each launched coin is its own NEP-141 token at `c<id>.pac-arena.testnet`
   (for example coin 0 is `c0.pac-arena.testnet`).
@@ -98,9 +98,24 @@ Call `launch_coin` with 300 Tgas and attached deposit = initial buy +
   "name": "Degen Coin",
   "symbol": "DEGEN",
   "description": "First PAC coin",
-  "initial_buy_yocto": "500000000000000000000000"
+  "initial_buy_yocto": "500000000000000000000000",
+  "image_url": "https://example.com/degen.png"
 }
 ```
+
+`image_url` is optional (null when omitted). When set it must start
+with `http://` or `https://` and be at most 500 characters; it is
+stored onchain with the coin and shown on the coin card and coin
+page. The coin creator can change it later with `set_coin_image`
+`{ "coin_id": 0, "image_url": "https://example.com/new.png" }`
+(creator only; null clears it). `get_coin` returns `image_url`
+(null when none). The coin page also shows a live price chart:
+price in NEAR per token over time, one point per trade, rebuilt
+from the activity feed (at most 500 events; the chart says so when
+older trades sit beyond that window), with volume bars under the
+line. Coin cards show a small sparkline of the same history plus
+the 24-hour price change (change since launch for coins younger
+than a day).
 
 The call returns the reserved coin id, but the coin record only
 appears once the token contract deploys — poll `get_coin(coin_id)`

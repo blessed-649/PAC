@@ -72,6 +72,12 @@
   .grad { font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px; display:inline-block; margin-top:10px; background:rgba(63,185,80,.13); color:var(--green); }
   .card .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
   .card .actions button { height:32px; padding:0 12px; font-size:12px; }
+  .sparkwrap { margin:2px 0 4px; }
+  .spark { width:120px; height:36px; display:block; }
+  .chg-up { color:var(--green); font-weight:700; }
+  .chg-down { color:var(--red); font-weight:700; }
+  .chart { width:100%; height:auto; display:block; }
+  .chartnote { color:var(--muted); font-size:12px; margin-top:6px; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th, td { text-align:left; padding:11px 14px; border-bottom:1px solid var(--line-soft); }
   th { color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.1em; }
@@ -217,11 +223,14 @@
       <p class="kicker">Create</p>
       <h2>Launch a coin</h2>
       <div class="panel">
-        <p class="muted small">Launching deploys a new NEP-141 token. Cost: your initial buy + 2 NEAR (funds the token account). Your initial buy tokens lock for 24 hours in the arena — claimable after that, never before. Gas: 300 Tgas (the launch deploys the token contract).</p>
+        <p class="muted small">Launching deploys a new NEP-141 token. Cost: your initial buy + 2 NEAR (funds the token account). Your initial buy tokens lock for 24 hours in the arena — claimable after that, never before. Gas: 300 Tgas (the launch deploys the token contract). An image URL is optional; it is stored onchain with the coin and shown on its card. The creator can change it later from the coin page.</p>
         <div class="row">
           <input id="launchName" placeholder="Name — e.g. Degen Coin" maxlength="64">
           <input id="launchSymbol" placeholder="Symbol — e.g. DEGEN" maxlength="12">
           <input id="launchBuy" type="number" min="0.1" step="0.1" value="0.5" placeholder="Initial buy (NEAR)">
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <input id="launchImage" placeholder="Image URL (optional) — https://… shown on the coin card" maxlength="500">
         </div>
         <div class="row" style="margin-top:10px;">
           <input id="launchDesc" placeholder="Description" maxlength="200">
