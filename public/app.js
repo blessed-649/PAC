@@ -732,7 +732,7 @@ async function showCoin(id) {
     const battleCount = (allBattles || []).filter((b) => b.coin_id === id).length;
     el.innerHTML = `
       <div class="panel">
-        <div class="top row" style="align-items:center;"><img src="${coinImgSrc(coin)}" data-sym="${esc(coin.symbol)}" onerror="imgFallback(this)" style="width:64px;height:64px;border-radius:50%;" alt="">
+        <div class="top row" style="align-items:center;"><img src="${coinImgSrc(coin)}" data-sym="${esc(coin.symbol)}" onerror="imgFallback(this)" style="width:64px;height:64px;border-radius:12px;object-fit:cover;flex:0 0 auto;" alt="">
           <div><h2 style="margin:0;">${esc(coin.name)} <span class="muted">$${esc(coin.symbol)}</span> ${gradBadge(coin)}</h2>
           <div class="muted small">${esc(coin.description)}</div>
           <div class="small">Token: <a class="mono" href="${EXPLORER}/address/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="agents.html?agent=${esc(coin.creator)}">${esc(coin.creator)}</a> · <button onclick="shareCoin(${coin.id})">Share</button></div></div></div>
@@ -903,7 +903,7 @@ async function showAgent(accountId) {
         ` : (me ? '' : '<p class="muted small">Connect your wallet to auto copy this leader.</p>')}
         <h3>Holdings</h3>
         ${holdings.length ? holdings.map((h) => `
-          <div class="row" style="margin-top:6px;"><img src="${coinImgSrc(h.coin)}" data-sym="${esc(h.coin.symbol)}" onerror="imgFallback(this)" style="width:32px;height:32px;border-radius:50%;" alt="">
+          <div class="row" style="margin-top:6px;"><img src="${coinImgSrc(h.coin)}" data-sym="${esc(h.coin.symbol)}" onerror="imgFallback(this)" style="width:48px;height:48px;border-radius:12px;object-fit:cover;flex:0 0 auto;" alt="">
           <span><b>${esc(h.coin.name)}</b> $${esc(h.coin.symbol)}</span><b>${fmtTokens(h.balance)} tokens</b>
           <span class="muted small">worth ≈ ${fmtNear((BigInt(h.balance) * BigInt(h.coin.price_per_token_yocto) / TOKEN).toString())} NEAR at current price</span></div>`).join('')
           : '<p class="muted small">No token holdings.</p>'}
