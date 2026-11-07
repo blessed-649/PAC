@@ -548,6 +548,7 @@ async function refreshHome() {
     for (const c of coins) historyByCoin[c.id] = reconstructHistory(c.id, BigInt(c.sold_tokens), historyFeed);
     renderCoins(coins, historyByCoin);
     renderActivity(activity);
+    renderActivityTicker();
     renderBattles(battles, duels);
     renderSeasonPanel();
     renderWatchlist(activity);
@@ -599,6 +600,7 @@ async function refreshArena() {
     $('arena-agents').textContent = stats.agents;
     $('arena-trades').textContent = stats.trades;
     $('arena-pool').textContent = fmtNear(pool) + ' NEAR';
+    renderActivityTicker();
   } catch (e) {
     console.error(e);
   }
@@ -643,6 +645,31 @@ function renderCoins(coins, historyByCoin) {
       ${lockBadge(c)} ${gradBadge(c)}
       <div class="actions"><button onclick="event.stopPropagation();shareCoin(${c.id})">Share</button></div>
     </div>`;}).join('');
+}
+
+// ---------- live activity ticker (horizontal, at the top) ----------
+// Newest first, scrolling left, duplicated once so the loop is seamless.
+// Older items slide away instead of sitting at the bottom of the page.
+async function renderActivityTicker() {
+  const el = $('activityTicker');
+  if (!el) return;
+  try {
+    const [activity, coins] = await Promise.all([
+      view('get_activity', { limit: 20 }),
+      view('list_coins', { from_index: 0, limit: 50 }),
+    ]);
+    if (coins.length) coinsCache = coins;
+    const items = activity.slice().reverse();
+    if (!items.length) { el.innerHTML = '<span class="muted small">No live activity yet.</span>'; return; }
+    const html = items.map((e) => {
+      const coin = coinsCache.find((c) => c.id === e.coin_id);
+      const name = coin ? esc(coin.name) : ('coin ' + e.coin_id);
+      return `<span class="ticker-item"><b>${esc(e.agent)}</b> ${esc(e.kind)} <b>${name}</b> <span>${esc(e.note || '')}</span> · ${timeAgo(e.timestamp_ns)}</span>`;
+    }).join('<span>◆</span>');
+    el.innerHTML = html + '<span>◆</span>' + html;
+  } catch (e) {
+    el.innerHTML = '<span class="muted small">Live activity unavailable right now.</span>';
+  }
 }
 
 function renderActivity(activity) {

@@ -116,6 +116,15 @@
   .row > *:not(img) { flex:1; min-width:140px; }
   .row img { flex:0 0 auto; width:48px; height:48px; object-fit:cover; border-radius:12px; }
   .row > a.btn, .row > button { flex:0 0 auto; min-width:0; }
+  /* Live activity ticker: a horizontal strip at the top, newest first,
+     scrolling left so older items slide away instead of burying the feed
+     at the bottom of the page. Pauses on hover. */
+  .ticker { overflow:hidden; border-bottom:1px solid var(--line); background:rgba(227,160,8,.06); padding:8px 0; position:relative; z-index:1; }
+  .ticker-track { display:inline-flex; gap:32px; white-space:nowrap; animation:ticker-scroll 90s linear infinite; will-change:transform; padding-left:16px; }
+  .ticker:hover .ticker-track { animation-play-state:paused; }
+  .ticker-item { display:inline-flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); }
+  .ticker-item b { color:var(--text); }
+  @keyframes ticker-scroll { from { transform:translateX(0); } to { transform:translateX(-50%); } }
   /* Coin images are always square: a wide source photo is cropped, never stretched. */
   .row button { flex:0 0 auto; }
   .muted { color:var(--muted); }
