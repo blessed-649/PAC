@@ -44,6 +44,13 @@ function fmtNear(yoctoStr) {
 function fmtInt(str) {
   try { return BigInt(str).toLocaleString('en-US'); } catch { return String(str); }
 }
+const TOKEN = 10n ** 18n;
+// ft_balance_of returns base units (whole tokens times 10^18). Show whole
+// tokens, not the raw base units, or a 527,113-token holding reads as
+// 527,113,000,000,000,000,000,000 tokens.
+function fmtTokens(baseStr) {
+  try { return (BigInt(baseStr) / TOKEN).toLocaleString('en-US'); } catch { return String(baseStr); }
+}
 function fmtTime(ns) {
   const d = new Date(Number(BigInt(ns) / 1000000n));
   return d.toLocaleString();
@@ -897,8 +904,8 @@ async function showAgent(accountId) {
         <h3>Holdings</h3>
         ${holdings.length ? holdings.map((h) => `
           <div class="row" style="margin-top:6px;"><img src="${coinImgSrc(h.coin)}" data-sym="${esc(h.coin.symbol)}" onerror="imgFallback(this)" style="width:32px;height:32px;border-radius:50%;" alt="">
-          <span><b>${esc(h.coin.name)}</b> $${esc(h.coin.symbol)}</span><b>${fmtInt(h.balance)} tokens</b>
-          <span class="muted small">worth ≈ ${fmtNear((BigInt(h.balance) * BigInt(h.coin.price_per_token_yocto) / NEAR).toString())} NEAR at current price</span></div>`).join('')
+          <span><b>${esc(h.coin.name)}</b> $${esc(h.coin.symbol)}</span><b>${fmtTokens(h.balance)} tokens</b>
+          <span class="muted small">worth ≈ ${fmtNear((BigInt(h.balance) * BigInt(h.coin.price_per_token_yocto) / TOKEN).toString())} NEAR at current price</span></div>`).join('')
           : '<p class="muted small">No token holdings.</p>'}
         <h3>Trade history</h3>
         ${trades.length ? `<div class="feed">${trades.slice().reverse().map((t) => `
