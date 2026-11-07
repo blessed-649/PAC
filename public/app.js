@@ -94,7 +94,7 @@ async function initWallet() {
     const keyStore = new nearApi.keyStores.BrowserLocalStorageKeyStore();
     nearConn = await nearApi.connect({
       networkId: 'testnet', nodeUrl: RPC_URL,
-      walletUrl: 'https://testnet.mynearwallet.com/',
+      walletUrl: 'https://wallet.meteorwallet.app/',
       helperUrl: 'https://helper.testnet.near.org', keyStore,
     });
     wallet = new nearApi.WalletConnection(nearConn, 'pac-demo');
