@@ -10,7 +10,10 @@ const EXPLORER = 'https://testnet.nearblocks.io';
 const NEAR = 10n ** 24n;
 const GAS_LAUNCH = 300_000_000_000_000n; // launch deploys a ~197KB token contract
 const GAS_STD = 100_000_000_000_000n;
-const BATTLE_FORFEIT_NEAR = '0.1';
+const BATTLE_MIN_STAKE_NEAR = '0.1'; // v7: challenger chooses the stake, min 0.1 NEAR, no max
+// The battle record stores the challenger's chosen stake in forfeit_yocto
+// (v7 keeps that field name); stake_yocto is accepted too if it ever renames.
+function battleStakeYocto(b) { return b.stake_yocto ?? b.forfeit_yocto ?? '0'; }
 
 // The arena link stays in the header (desktop nav and mobile menu),
 // labelled "PAC Arena", pointing at the explorer page for the arena
@@ -79,6 +82,19 @@ function lockBadge(coin) {
   if (coin.lock_status === 'claimable') return `<span class="lock claimable">Lock expired — claimable</span>`;
   return `<span class="lock claimed">Lock claimed</span>`;
 }
+
+// ---------- agent registration (v7) ----------
+// A wallet is an agent only when it registered onchain with
+// register_agent. get_agent returns is_agent for registered wallets.
+// On v6 the field is missing, so a missing field reads as false and
+// the wallet shows no badge. Never treat a missing field as registered.
+const isRegisteredAgent = (a) => !!a && a.is_agent === true;
+const agentBadge = (a) => isRegisteredAgent(a)
+  ? `<span class="agent-badge" title="Registered agent. This wallet registered onchain with register_agent.">◆ AGENT</span>`
+  : '';
+// Cache of account -> is_agent, filled by the leaderboard and reused by
+// the weekly board so it does not refetch every account.
+const agentRegCache = new Map();
 
 // ---------- graduation ----------
 // The contract has no graduation constant. The curve sells 800,000,000
@@ -334,9 +350,21 @@ async function renderWeeklyBoard() {
     const ranked = board.filter((r) => r.account !== ARENA_ID);
     const start = new Date(Number(BigInt(season.start_ns) / 1000000n));
     if (label) label.textContent = 'Season ' + season.id + ' · week of ' + start.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC). Prize pool ' + fmtNear(season.pool_yocto) + ' NEAR.';
+    // Badge registered agents. The season board only carries the
+    // account and PnL, so read is_agent from the leaderboard cache
+    // where possible and fetch get_agent for the rest, best effort.
+    const badges = [];
+    for (const r of ranked.slice(0, 20)) {
+      if (agentRegCache.has(r.account)) { badges.push(agentRegCache.get(r.account)); continue; }
+      try {
+        const a = await view('get_agent', { account: r.account });
+        agentRegCache.set(r.account, isRegisteredAgent(a));
+        badges.push(isRegisteredAgent(a));
+      } catch { badges.push(false); }
+    }
     body.innerHTML = ranked.length ? ranked.slice(0, 20).map((r, i) => `
       <tr onclick="location.href='agents.html?agent=${esc(r.account)}'">
-        <td>${i + 1}</td><td>${esc(r.account)}</td>
+        <td>${i + 1}</td><td>${esc(r.account)}${agentBadge({ is_agent: badges[i] })}</td>
         <td>${fmtNear(r.realised_pnl_yocto)} NEAR</td>
       </tr>`).join('') : '<tr><td colspan="3" class="muted">No trades this week yet.</td></tr>';
   } catch (e) {
@@ -520,7 +548,7 @@ async function refreshHome() {
     $('paramsBox').innerHTML = `
       <div class="kv">
         <span>Creator lock</span><b>${params.lock_duration_hours} hours, immutable, enforced by the contract</b>
-        <span>Battle</span><b>${params.battle_duration_hours}h window · forfeit ${fmtNear(params.battle_forfeit_yocto)} NEAR · winner takes both stakes</b>
+        <span>Battle</span><b>${params.battle_duration_hours}h window · challenger chooses the stake (min ${fmtNear(params.battle_min_stake_yocto ?? params.battle_forfeit_yocto)} NEAR) · opponent matches it · winner takes both stakes</b>
         <span>Reputation</span><b>out of 1000 — realised PnL ${params.rep_weight_pnl}% · win rate ${params.rep_weight_win_rate}% · avg hold time ${params.rep_weight_hold_time}% · rug zeroes the score</b>
         <span>Milestones</span><b>${params.milestone_holders.join(' / ')} holders → burn ${params.milestone_burn_bp / 100}% of supply · +${fmtInt(params.milestone_tranche_tokens)} curve tokens · ${fmtInt(params.milestone_airdrop_tokens)}-token airdrop</b>
         <span>Supply votes</span><b>holders vote by holdings, one vote each · ${params.vote_choices.join(' / ')} · burn/mint ${params.vote_burn_bp / 100}% of supply · ${params.vote_min_duration_hours}–${params.vote_max_duration_hours}h rounds</b>
@@ -529,6 +557,7 @@ async function refreshHome() {
         <span>Trading fee</span><b>${params.trading_fee_bp / 100}% on every buy and sell, paid into the weekly prize pool; the buyer still gets the same tokens for the same curve cost</b>
         <span>Auto copy</span><b>follow a leader with a fixed amount per trade (${fmtNear(params.copy_min_per_trade_yocto)}–${fmtNear(params.copy_max_per_trade_yocto)} NEAR) and a max total (min ${fmtNear(params.copy_min_max_total_yocto)} NEAR); each copy pays a ${params.copy_fee_bp / 100}% fee to the leader; copied tokens sit in the arena vault until sold or withdrawn</b>
         <span>Weekly season</span><b>7 days, Monday to Monday; top 3 by weekly realised PnL split the prize pool ${params.season_top_shares_bp.map((b) => (b / 100) + '%').join(' / ')}; any undistributed share rolls into the next season</b>
+        ${params.agent_registration_enabled === true ? `<span>Agent registration</span><b>Enabled. A wallet becomes an agent only by calling register_agent (no arguments, no deposit). Trading alone does not register a wallet.</b>` : ''}
         <span>Graduation</span><b>a coin graduates at 793,100,000 tokens sold on the curve (bot.fun level); the card shows a Graduated badge</b>
         <span>Launch cost</span><b>${fmtNear(params.launch_cost_yocto)} NEAR + initial buy (min ${fmtNear(params.min_initial_buy_yocto)} NEAR)</b>
       </div>`;
@@ -614,8 +643,8 @@ function renderBattles(battles, duels) {
   if (battleEl) battleEl.innerHTML = battles.length ? battles.slice().reverse().map((b) => `
     <div class="panel small" style="margin-bottom:8px;">
       <div class="row"><b>Battle ${b.id}</b><span class="pill ${b.status}">${esc(b.status)}</span><span class="muted">${esc(b.agent_a)} vs ${esc(b.agent_b)}</span></div>
-      <div class="muted small">Coin ${b.coin_id} · forfeit ${fmtNear(b.forfeit_yocto)} NEAR · ends ${fmtTime(b.end_ns)}${b.winner ? ' · winner: ' + esc(b.winner) : ''}</div>
-      ${b.status === 'active' && getWalletAccountId() === b.agent_b ? `<button onclick="acceptBattle(${b.id})">Accept (0.1 NEAR)</button>` : ''}
+      <div class="muted small">Coin ${b.coin_id} · stake ${fmtNear(battleStakeYocto(b))} NEAR each · ends ${fmtTime(b.end_ns)}${b.winner ? ' · winner: ' + esc(b.winner) : ''}</div>
+      ${b.status === 'active' && getWalletAccountId() === b.agent_b ? `<button onclick="acceptBattle(${b.id}, '${battleStakeYocto(b)}')">Accept — match ${fmtNear(battleStakeYocto(b))} NEAR</button>` : ''}
       ${b.status === 'active' ? `<button onclick="resolveBattle(${b.id})">Resolve</button>` : ''}
     </div>`).join('') : '<p class="muted">No battles yet.</p>';
   const duelEl = $('duelList');
@@ -625,6 +654,30 @@ function renderBattles(battles, duels) {
       <div class="muted small">24h on trading volume · loser pays 5% of its treasury · ends ${fmtTime(d.end_ns)}${d.winner !== null && d.winner !== undefined ? ' · winner: coin ' + d.winner : ''}</div>
       ${d.status === 'active' ? `<button onclick="resolveDuel(${d.id})">Resolve</button>` : ''}
     </div>`).join('') : '<p class="muted">No duels yet.</p>';
+}
+
+// The leaderboard rows are kept so the registered agents only filter
+// can re-render without refetching.
+let leaderRowsCache = [];
+let agentsOnlyFilter = false;
+function toggleAgentsOnly(on) {
+  agentsOnlyFilter = !!on;
+  renderLeaderRows();
+}
+function renderLeaderRows() {
+  const leaderEl = $('leaderBody');
+  if (!leaderEl) return;
+  const rows = agentsOnlyFilter ? leaderRowsCache.filter((a) => isRegisteredAgent(a)) : leaderRowsCache;
+  leaderEl.innerHTML = rows.length ? rows.map((a, i) => `
+    <tr onclick="location.href='agents.html?agent=${esc(a.account)}'">
+      <td>${i + 1}</td><td>${esc(a.account)}${agentBadge(a)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''} ${followBtn(a.account)}</td>
+      <td class="score">${a.score}<span class="band ${a.band}">${esc(a.band)}</span></td>
+      <td>${fmtNear(a.realised_pnl_yocto)} NEAR</td><td>${(a.win_rate_bp / 100).toFixed(1)}%</td>
+      <td>${a.avg_hold_hours}h</td><td>${a.battles_won}/${a.battles_played}</td>
+      <td>${a._copiers}</td><td>${fmtNear(a._copyFees)} NEAR</td>
+    </tr>`).join('') : (agentsOnlyFilter
+      ? '<tr><td colspan="9" class="muted">No registered agents yet. A wallet becomes an agent only by registering onchain with register_agent.</td></tr>'
+      : '<tr><td colspan="9" class="muted">No agents yet.</td></tr>');
 }
 
 async function renderLeaderboard(coins, activity) {
@@ -639,18 +692,14 @@ async function renderLeaderboard(coins, activity) {
     try { rows.push(await view('get_agent', { account: id })); } catch { /* skip */ }
   }
   rows.sort((a, b) => (b.score - a.score) || (BigInt(b.realised_pnl_yocto) > BigInt(a.realised_pnl_yocto) ? 1 : -1));
-  const copyStats = await Promise.all(rows.slice(0, 20).map((a) =>
+  const top = rows.slice(0, 20);
+  const copyStats = await Promise.all(top.map((a) =>
     view('get_copy_stats', { leader: a.account }).catch(() => ({ copier_count: 0, total_fees_earned_yocto: '0' }))));
-  const leaderEl = $('leaderBody');
-  if (!leaderEl) return;
-  leaderEl.innerHTML = rows.length ? rows.slice(0, 20).map((a, i) => `
-    <tr onclick="location.href='agents.html?agent=${esc(a.account)}'">
-      <td>${i + 1}</td><td>${esc(a.account)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''} ${followBtn(a.account)}</td>
-      <td class="score">${a.score}<span class="band ${a.band}">${esc(a.band)}</span></td>
-      <td>${fmtNear(a.realised_pnl_yocto)} NEAR</td><td>${(a.win_rate_bp / 100).toFixed(1)}%</td>
-      <td>${a.avg_hold_hours}h</td><td>${a.battles_won}/${a.battles_played}</td>
-      <td>${copyStats[i].copier_count}</td><td>${fmtNear(copyStats[i].total_fees_earned_yocto)} NEAR</td>
-    </tr>`).join('') : '<tr><td colspan="9" class="muted">No agents yet.</td></tr>';
+  top.forEach((a, i) => { a._copiers = copyStats[i].copier_count; a._copyFees = copyStats[i].total_fees_earned_yocto; });
+  rows.slice(20).forEach((a) => { a._copiers = 0; a._copyFees = '0'; });
+  leaderRowsCache = top;
+  top.forEach((a) => agentRegCache.set(a.account, isRegisteredAgent(a)));
+  renderLeaderRows();
 }
 
 // ---------- coin detail ----------
@@ -740,8 +789,8 @@ async function showCoin(id) {
         </div>
         <div class="panel">
           <h3>Start an agent battle on this coin</h3>
-          <p class="muted small">24h window, 0.1 NEAR forfeit each, realised PnL on this coin decides the winner. The opponent accepts with their own 0.1 NEAR.</p>
-          <div class="row"><input id="battleOpponent" placeholder="Opponent agent account (e.g. holder-pac.testnet)"><button class="primary" onclick="createBattle(${coin.id})">Challenge (0.1 NEAR)</button></div>
+          <p class="muted small">24h window. You choose the stake — minimum 0.1 NEAR, no maximum. The opponent must match your stake exactly to accept. Realised PnL on this coin decides the winner: winner takes both stakes, a tie refunds each.</p>
+          <div class="row"><input id="battleStake" type="number" min="0.1" step="0.1" value="0.1" placeholder="Stake (NEAR, min 0.1)"><input id="battleOpponent" placeholder="Opponent agent account (e.g. holder-pac.testnet)"><button class="primary" onclick="createBattle(${coin.id})">Challenge</button></div>
         </div>
       </div>
 
@@ -787,10 +836,12 @@ async function showAgent(accountId) {
   if (!el) return;
   el.innerHTML = '<p class="muted">Loading agent…</p>';
   try {
-    const [agent, trades] = await Promise.all([
+    const [agent, trades, params] = await Promise.all([
       view('get_agent', { account: accountId }),
       view('get_agent_trades', { account: accountId, limit: 50 }),
+      loadParams().catch(() => null),
     ]);
+    const regEnabled = !!params && params.agent_registration_enabled === true;
     const coins = await view('list_coins', { from_index: 0, limit: 50 });
     const holdings = [];
     for (const c of coins) {
@@ -813,8 +864,13 @@ async function showAgent(accountId) {
     }
     el.innerHTML = `
       <div class="panel">
-        <h2 style="margin-top:0;">${esc(accountId)} <button class="followbtn" onclick="toggleFollow('${esc(accountId)}')">${isFollowing(accountId) ? 'Unfollow' : 'Follow'}</button></h2>
+        <h2 style="margin-top:0;">${esc(accountId)}${agentBadge(agent)} <button class="followbtn" onclick="toggleFollow('${esc(accountId)}')">${isFollowing(accountId) ? 'Unfollow' : 'Follow'}</button></h2>
+        <p class="muted small">A wallet becomes an agent only by registering onchain with register_agent. Trading alone does not make a wallet an agent.</p>
+        ${me && me === accountId && !isRegisteredAgent(agent) ? (regEnabled
+          ? `<div class="row" style="margin-top:10px;"><button class="primary" onclick="registerAgent()">Register this wallet as an agent</button><span class="muted small">Calls register_agent: no arguments, no deposit. Only this wallet can register itself.</span></div>`
+          : `<p class="muted small">Agent registration is not live on this arena version yet. It arrives with the v7 upgrade.</p>`) : ''}
         <div class="kv">
+          <span>Agent status</span><b>${isRegisteredAgent(agent) ? 'Registered agent' : 'Plain wallet'}</b>
           <span>Reputation</span><b class="score">${agent.score} / 1000 <span class="band ${agent.band}">${esc(agent.band)}</span>${agent.rugged ? ' <span class="band rugged">RUGGED</span>' : ''}</b>
           <span>Realised PnL</span><b>${fmtNear(agent.realised_pnl_yocto)} NEAR</b>
           <span>Total spent / received</span><b>${fmtNear(agent.total_spent_yocto)} / ${fmtNear(agent.total_received_yocto)} NEAR</b>
@@ -997,22 +1053,46 @@ async function createBattle(coinId) {
   const me = requireWallet(); if (!me) return;
   const opponent = $('battleOpponent').value.trim();
   if (!opponent) { status('Enter the opponent agent account.'); return; }
+  let stakeYocto;
+  try { stakeYocto = parseNearFloat($('battleStake').value || BATTLE_MIN_STAKE_NEAR); } catch { status('Enter a valid stake amount in NEAR.'); return; }
+  if (stakeYocto < parseNearFloat(BATTLE_MIN_STAKE_NEAR)) { status('Battle stake must be at least 0.1 NEAR.'); return; }
   try {
-    status('Challenging — confirm 0.1 NEAR forfeit in your wallet…', 0);
-    await walletCall(ARENA_ID, 'create_battle', { coin_id: coinId, opponent }, parseNearFloat(BATTLE_FORFEIT_NEAR));
-    status('Battle created! The opponent accepts with their own 0.1 NEAR.', 8000);
+    status(`Challenging — confirm ${fmtNear(stakeYocto.toString())} NEAR stake in your wallet…`, 0);
+    await walletCall(ARENA_ID, 'create_battle', { coin_id: coinId, opponent }, stakeYocto);
+    status(`Battle created! The opponent must match your ${fmtNear(stakeYocto.toString())} NEAR stake to accept.`, 8000);
     setTimeout(() => showCoin(coinId), 3000);
   } catch (e) { status('Challenge failed: ' + String(e.message).slice(0, 160), 9000); }
 }
-async function acceptBattle(battleId) {
+async function acceptBattle(battleId, stakeYocto) {
   const me = requireWallet(); if (!me) return;
-  try { await walletCall(ARENA_ID, 'accept_battle', { battle_id: battleId }, parseNearFloat(BATTLE_FORFEIT_NEAR)); status('Battle accepted — 24h window running.', 8000); setTimeout(refreshCurrent, 3000); }
-  catch (e) { status('Accept failed: ' + String(e.message).slice(0, 160), 9000); }
+  try {
+    // The opponent must attach exactly the battle's stored stake.
+    if (stakeYocto === undefined || stakeYocto === null) {
+      const battle = await view('get_battle', { battle_id: battleId });
+      stakeYocto = battleStakeYocto(battle);
+    }
+    const stake = BigInt(stakeYocto);
+    status(`Accepting — confirm ${fmtNear(stake.toString())} NEAR (the battle's stake) in your wallet…`, 0);
+    await walletCall(ARENA_ID, 'accept_battle', { battle_id: battleId }, stake);
+    status('Battle accepted — 24h window running.', 8000); setTimeout(refreshCurrent, 3000);
+  } catch (e) { status('Accept failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function resolveBattle(battleId) {
   const me = requireWallet(); if (!me) return;
   try { await walletCall(ARENA_ID, 'resolve_battle', { battle_id: battleId }, 0n); status('Battle resolved — winner paid automatically.', 8000); setTimeout(refreshCurrent, 3000); }
   catch (e) { status('Resolve failed (window may not be over): ' + String(e.message).slice(0, 160), 9000); }
+}
+// Agent registration (v7): the connected wallet registers itself as an
+// agent. No arguments, no deposit, idempotent. Only shown on your own
+// agent page while registration is enabled and you are unregistered.
+async function registerAgent() {
+  const me = requireWallet(); if (!me) return;
+  try {
+    status('Registering as an agent. Confirm in your wallet…', 0);
+    await walletCall(ARENA_ID, 'register_agent', {}, 0n);
+    status('Registered as an agent! The gold AGENT badge now shows next to this wallet.', 8000);
+    setTimeout(() => showAgent(me), 3000);
+  } catch (e) { status('Registration failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function createDuel(coinId) {
   const me = requireWallet(); if (!me) return;

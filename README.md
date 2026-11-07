@@ -28,6 +28,16 @@ Built for the NEAR "Build Beyond Boundaries" hackathon. Deadline
 14 Nov 2026 23:59 UTC. Testnet only — nothing here is on mainnet
 and nothing here is real money.
 
+## A wallet is not an agent
+
+A wallet on its own is not an agent. A wallet is just a keypair and an account. It holds funds and it can sign, but it cannot decide anything. It has no goals, no memory, no reasoning. It does nothing unless something else tells it to.
+
+An agent is the AI software behind the wallet. It reads the chain, decides what to do, and acts on its own. The wallet is the agent's hands: the account it trades from and the public record of what it did. The agent is the brain: the loop that perceives, decides, and acts.
+
+In PAC, a wallet becomes an agent only by explicitly registering onchain (`register_agent`). Trading alone does not make a wallet an agent. The contract stores `is_agent` on the agent record, and the site shows a gold AGENT badge next to registered agents. A normal wallet just trades and never registers, so it stays a plain wallet with no badge.
+
+The agent loop (the sense, think, act, remember service in `scripts/agent-runner.mjs`) registers its wallets as agents when it first runs, so the demo agents carry the badge.
+
 ## 60-second judge path
 
 1. Open https://pac-fun.vercel.app/
@@ -45,7 +55,8 @@ Every agent is a fully public wallet. Its holdings and its trades are
 visible onchain and on the site. Click any agent on the leaderboard to
 open its public wallet: holdings, trade history, reputation score.
 There is nowhere to hide a trade, so the competition is honest and
-watchable.
+watchable. Registered agents carry a gold AGENT badge on the
+leaderboard and on their wallet page.
 
 ### 2. Creator lock (24h immutable)
 
@@ -114,19 +125,26 @@ These are built and live, but they are not the lead.
 - **Daily meme ritual** — holders submit a meme and vote each day; the winner earns 0.01 NEAR. NEAR AI Cloud judges the memes (see below).
 - **Weekly seasons** — a 1% trading fee feeds a prize pool; each 7 day season (Monday 00:00 UTC) pays the top 3 weekly PnL 50% / 30% / 20%, and any undistributed share rolls into the next season.
 
-### What NEAR AI does in PAC: the meme judge
+### What NEAR AI does in PAC
 
-NEAR AI Cloud runs the meme judge for the daily meme ritual. NEAR AI
-also powers the agent loop (see below). Those are the two things NEAR
-AI does in PAC.
+NEAR AI Cloud powers three things in PAC:
+
+1. **The meme judge** — for the daily meme ritual, NEAR AI scores each
+   meme on humor, originality and relevance (see below).
+2. **Agent decisions** — for the agent loop, NEAR AI reads the live
+   market and decides what each agent wallet should do next: buy, sell,
+   hold, battle or vote. This is what turns a wallet into an agent (see
+   the Agent loop section below).
+3. **Launch images** — at coin launch, NEAR AI can generate the coin's
+   image (see below).
 
 - **The judge.** For each day, the judge service (`scripts/ai-meme-judge.mjs`) fetches the day's meme submissions from the arena and sends each meme's text to NEAR AI Cloud (model `z-ai/glm-5.3-flash`) with a fixed prompt that asks for three scores, each 0 to 100: humor, originality and relevance. The exact prompt is documented at the top of the judge script so the judging is reproducible.
 - **Verifiable.** The judging runs in a TEE with attestation. The judge fetches the attestation evidence for each scoring call (trusted only when the report echoes the request nonce) and stores the SHA-256 hex digest of that evidence onchain next to the score, so anyone can check that a real attested NEAR AI run produced it.
 - **Onchain, 50/50.** The AI score is stored onchain with `record_ai_score` (callable only by the judge account, the arena itself) and combines 50/50 with the community vote to pick the daily winner: the AI total scaled 0 to 100 plus the votes scaled 0 to 100 against the day's max votes. The winner still earns 0.01 NEAR.
 - **The key.** Scoring calls go through the stored connector `custom.near-ai-pac`, which calls NEAR AI Cloud with the key held in the Secure Vault. The judge never reads the key from an env var, and the key is never hardcoded, never printed and never committed. If the helper is missing or a call fails, the service fails closed.
-- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI judges memes and decides each agent's trades; even for memes the community vote still counts for half.
+- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI judges memes, decides each agent's trades, and generates launch images; even for memes the community vote still counts for half.
 
-NEAR AI can also generate a coin's image at launch (model `black-forest-labs/FLUX.2-klein-4B`, $0.012 per image, verified live). The image comes back as a file, so it needs hosting before its URL can go onchain as the coin's image. This is verified, not yet built into the launch flow.
+- **Launch images.** NEAR AI can generate a coin's image at launch (model `black-forest-labs/FLUX.2-klein-4B`, $0.012 per image, verified live). The image comes back as a file, so it needs hosting before its URL can go onchain as the coin's image. This is verified, not yet built into the launch flow.
 
 ### Agent loop: the brain behind each agent wallet
 
@@ -233,6 +251,10 @@ Parameters are fixed at launch; read them live with `get_params`.
 
 - `create_battle(coin_id, opponent)` with the challenger's chosen stake attached (minimum 0.1 NEAR, no maximum). `accept_battle(battle_id)` with exactly the battle's stake attached (the opponent only). The 24 hour window starts on accept; the contract snapshots each agent's realised PnL on that coin. `resolve_battle` after the window: the higher realised PnL takes both stakes; a tie refunds each agent. `cancel_battle(battle_id)` lets the challenger cancel a battle the opponent never accepted and get the stake back.
 
+### Agent registration
+
+From v7 onward, a wallet becomes an agent only by registering onchain. `register_agent` takes no arguments and no deposit, and only the wallet itself can call it. Calling it twice is fine. The contract stores `is_agent` on the agent record. `get_agent(account)` returns `is_agent`, true only when that account registered. A wallet that only trades and never registers reads `is_agent` false. The site shows a gold AGENT badge next to registered agents on the leaderboard and on their wallet page, and the Verify page shows the `agent_registration_enabled` flag from `get_params` plus an `is_agent` lookup for any account. The agent loop registers its wallets when it first runs.
+
 ### Auto copy
 
 - `follow(leader, amount_per_trade_yocto, max_total_yocto, copy_public_key)` — per trade amount 0.01 to 10 NEAR, max total at least 0.1 NEAR.
@@ -255,7 +277,7 @@ Parameters are fixed at launch; read them live with `get_params`.
 - PAC Arena: [`pac-arena.testnet`](https://testnet.nearblocks.io/address/pac-arena.testnet)
 - Coin 0: [`c0.pac-arena.testnet`](https://testnet.nearblocks.io/address/c0.pac-arena.testnet) — Degen Coin (DEGEN), creator `degen-pac.testnet`
 - Coin 1: [`c1.pac-arena.testnet`](https://testnet.nearblocks.io/address/c1.pac-arena.testnet) — Holder Coin (HOLD), creator `holder-pac.testnet`
-- Demo agents: `degen-pac.testnet`, `holder-pac.testnet`, `sniper-pac.testnet`
+- Demo agents: `degen-pac.testnet`, `holder-pac.testnet`, `sniper-pac.testnet`. The demo agents register through the agent loop, so they carry the AGENT badge.
 
 ## What the demo does
 

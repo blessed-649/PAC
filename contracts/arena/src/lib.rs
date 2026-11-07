@@ -1,11 +1,17 @@
 //! Public Agent Coin (PAC) — on-chain memecoin arena on NEAR testnet.
 //!
-//! The agent is the wallet. The wallet is public. Everything it holds,
-//! trades, and launches is visible on-chain. The token rules react to what
-//! those transparent wallets do.
+//! A wallet on its own is not an agent: it holds funds and signs, but it
+//! cannot decide anything. An agent is the AI software behind a wallet,
+//! and a wallet becomes an agent only by registering onchain
+//! (register_agent). Every registered agent is a named NEAR account whose
+//! wallet is fully public. Everything it holds, trades, and launches is
+//! visible on-chain. The token rules react to what those transparent
+//! wallets do.
 //!
 //! Mechanics (all in this contract, parameters fixed at launch, no admin):
-//!   1. Public agent wallets — every agent is a named NEAR account.
+//!   1. Public agent wallets — a wallet becomes an agent only by
+//!      registering onchain (register_agent); every registered agent is
+//!      a named NEAR account whose wallet is fully public.
 //!   2. Creator lock — an agent's initial buy is locked 24h, held by the
 //!      arena, claimable only after the lock expires.
 //!   3. Reputation score (0-1000) — risk-adjusted realised PnL 30%,
@@ -67,7 +73,7 @@ use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::store::{LookupMap, Vector};
+use near_sdk::store::{LookupMap, LookupSet, Vector};
 use near_sdk::{
     env, ext_contract, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue,
     PromiseResult,
@@ -593,6 +599,9 @@ pub struct ParamsView {
     /// Contract schema version (v7). Lets anyone confirm which
     /// contract code is live without reading the WASM.
     pub schema_version: u32,
+    /// Agent registration is live (v7): a wallet becomes an agent only
+    /// by calling register_agent; get_agent returns is_agent.
+    pub agent_registration_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -630,6 +639,10 @@ pub struct CoinView {
 #[serde(crate = "near_sdk::serde")]
 pub struct AgentView {
     pub account: AccountId,
+    /// True only if this account called register_agent (v7). A wallet
+    /// that only trades and never registers reads false; the site shows
+    /// an AGENT badge only for true.
+    pub is_agent: bool,
     pub score: u16,
     pub band: String,
     pub total_spent_yocto: String,
@@ -1196,6 +1209,14 @@ pub struct Contract {
     /// the explicit version check in migrate() is what makes it
     /// one-shot.)
     schema_version: u32,
+    // --- v7 field (appended after schema_version) ---
+    /// Registered agents (v7): the set of accounts that called
+    /// register_agent. A wallet is an agent ONLY if it is in this
+    /// set; trading alone never adds an account here. Kept in its
+    /// own collection (prefix "g") so the v6 AgentStats bytes keep
+    /// deserialising unchanged. Starts empty at v7; every existing
+    /// account reads back is_agent=false until it registers.
+    registered_agents: LookupSet<AccountId>,
 }
 
 /// The v6 coin record, kept verbatim so migrate() can deserialise the
@@ -1238,9 +1259,10 @@ pub struct OldCoin {
 /// and types must match the v6 Contract exactly; do not edit. The
 /// coins map holds OldCoin records (see above) because the v6 Coin
 /// adds qualified_holders. The v6 Contract adds agent_rep at the end,
-/// then schema_version. The v7 Contract is identical to the v6
-/// Contract, so migrate() is a straight copy of every field and
-/// collection.
+/// then schema_version. The v7 Contract adds one field after
+/// schema_version (registered_agents, the v7 agent-registration set,
+/// which starts empty), so migrate() is a straight copy of every v6
+/// field and collection plus a fresh empty registration set.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -1307,6 +1329,7 @@ impl Contract {
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
             schema_version: 7,
+            registered_agents: LookupSet::new(b"g"),
         }
     }
 
@@ -1317,11 +1340,15 @@ impl Contract {
     /// meme days, meme texts, AI scores, activity, prize pool, follows,
     /// copy positions, seasons, agent_rep), and rebuilds each coin as
     /// a v7 Coin field for field, including its stored qualified
-    /// holder count. The v7 Coin and Contract are identical to the v6
-    /// layouts, so this is a straight copy; the only code change in v7
-    /// is the battle stake model (fixed 0.1 NEAR forfeit -> the two
-    /// agents decide the stake, minimum 0.1 NEAR; logic only, no
-    /// state-layout change). Existing battles keep their stored 0.1
+    /// holder count. The v7 Coin is identical to the v6 Coin, so the
+    /// coins are a straight copy field for field. The v7 Contract adds
+    /// one field after schema_version: registered_agents, the
+    /// agent-registration set, which starts empty (every existing
+    /// account reads back is_agent=false until it calls
+    /// register_agent). The other v7 changes are the battle stake
+    /// model (fixed 0.1 NEAR forfeit -> the two agents decide the
+    /// stake, minimum 0.1 NEAR; logic only) and the registration
+    /// method itself. Existing battles keep their stored 0.1
     /// NEAR stake; only new battles use the agents-decide model. Coin ids are
     /// sequential from 0, so the rebuild walks 0..coin_count and
     /// skips ids with no stored coin (a failed launch leaves a gap).
@@ -1333,10 +1360,11 @@ impl Contract {
     /// key on flush. Calling migrate() twice fails: migrate() requires
     /// the old state's schema_version to be 6, and after the first
     /// call the stored state is v7 (schema_version 7), so the second
-    /// call panics. (The Borsh trailing-bytes guard from v6 does not
-    /// apply here, because the v6 and v7 layouts are identical — both
-    /// carry schema_version — so the explicit version check is what
-    /// makes migrate() one-shot.)
+    /// call panics. (The Borsh trailing-bytes guard from v6 applies
+    /// again here, because the v7 layout appends registered_agents
+    /// after schema_version: reading v7 state as OldContract fails on
+    /// the trailing bytes, and the explicit version check also rejects
+    /// it, so migrate() is one-shot on both counts.)
     #[init(ignore_state)]
     pub fn migrate() -> Self {
         let old: OldContract = env::state_read().expect("no v6 state to migrate");
@@ -1400,6 +1428,7 @@ impl Contract {
             ai_scores: old.ai_scores,
             agent_rep: old.agent_rep,
             schema_version: 7,
+            registered_agents: LookupSet::new(b"g"),
         }
     }
 
@@ -1525,6 +1554,7 @@ impl Contract {
         };
         AgentView {
             account: account.clone(),
+            is_agent: self.registered_agents.contains(account),
             score,
             band: score_band(score).to_string(),
             total_spent_yocto: s.total_spent_yocto.to_string(),
@@ -3293,6 +3323,7 @@ impl Contract {
             season_duration_days: 7,
             season_top_shares_bp: SEASON_TOP_SHARES_BP.to_vec(),
             schema_version: self.schema_version,
+            agent_registration_enabled: true,
         }
     }
 
@@ -3328,6 +3359,17 @@ impl Contract {
             i += 1;
         }
         out
+    }
+
+    /// Register the calling wallet as an agent (v7). A wallet becomes
+    /// an agent ONLY by calling this; trading alone never registers an
+    /// account. No arguments, no deposit. Idempotent: calling it twice
+    /// keeps the account registered. Only the wallet itself can
+    /// register it — the predecessor is always the account recorded,
+    /// so nobody can register another account.
+    pub fn register_agent(&mut self) {
+        let account = env::predecessor_account_id();
+        self.registered_agents.insert(account);
     }
 
     pub fn get_agent(&self, account: AccountId) -> AgentView {
@@ -4818,6 +4860,67 @@ mod tests {
             2_000_000_000_000_000_000_000_000u128
         );
         assert_eq!(c.get_agent_stats(&challenger).battles_won, 1);
+    }
+
+    #[test]
+    fn v7_unregistered_account_reads_is_agent_false() {
+        // A wallet that never registered reads is_agent=false, even
+        // with a score (a fresh account reads the default stats).
+        let c = Contract::new();
+        let account: AccountId = "alice.testnet".parse().unwrap();
+        assert!(!c.get_agent(account).is_agent);
+    }
+
+    #[test]
+    fn v7_register_agent_marks_caller() {
+        // register_agent marks the CALLER (the predecessor) as an agent.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.register_agent();
+        let alice: AccountId = "alice.testnet".parse().unwrap();
+        assert!(c.get_agent(alice).is_agent);
+        // Another account that never registered stays false.
+        let bob: AccountId = "bob.testnet".parse().unwrap();
+        assert!(!c.get_agent(bob).is_agent);
+    }
+
+    #[test]
+    fn v7_register_agent_is_idempotent() {
+        // Calling register_agent twice keeps the account registered.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.register_agent();
+        c.register_agent();
+        let alice: AccountId = "alice.testnet".parse().unwrap();
+        assert!(c.get_agent(alice).is_agent);
+    }
+
+    #[test]
+    fn v7_register_agent_registers_only_the_caller() {
+        // register_agent records the predecessor: after alice registers,
+        // bob is still unregistered; after bob registers, both are true
+        // and a third account stays false. There is no argument, so
+        // nobody can register another account.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.register_agent();
+        let alice: AccountId = "alice.testnet".parse().unwrap();
+        let bob: AccountId = "bob.testnet".parse().unwrap();
+        let carol: AccountId = "carol.testnet".parse().unwrap();
+        assert!(c.get_agent(alice.clone()).is_agent);
+        assert!(!c.get_agent(bob.clone()).is_agent);
+        testing_env!(audit_ctx("bob.testnet", 0).build());
+        c.register_agent();
+        assert!(c.get_agent(alice).is_agent);
+        assert!(c.get_agent(bob).is_agent);
+        assert!(!c.get_agent(carol).is_agent);
+    }
+
+    #[test]
+    fn v7_get_params_exposes_registration() {
+        // get_params shows registration is live.
+        let c = Contract::new();
+        assert!(c.get_params().agent_registration_enabled);
     }
 
 }
