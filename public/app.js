@@ -465,22 +465,27 @@ async function showCoin(id) {
   const el = $('coinDetail');
   el.innerHTML = '<p class="muted">Loading coin…</p>';
   try {
-    const [coin, rounds, memeDay, params] = await Promise.all([
+    const [coin, rounds, memeDay, params, allBattles] = await Promise.all([
       view('get_coin', { coin_id: id }),
-      view('list_vote_rounds', { coin_id: id, from_index: 0, limit: 5 }),
+      view('list_vote_rounds', { coin_id: id, from_index: 0, limit: 50 }),
       view('get_meme_day', { coin_id: id, day: 0 }),
       loadParams(),
+      view('list_battles', { from_index: 0, limit: 50 }).catch(() => []),
     ]);
     if (!coin) { el.innerHTML = '<p>Coin not found.</p>'; return; }
     const dayIdx = Math.floor((Date.now() - Number(BigInt(coin.created_at_ns) / 1000000n)) / 86400000);
     const day = dayIdx === 0 ? memeDay : await view('get_meme_day', { coin_id: id, day: dayIdx }).catch(() => null);
     const me = getWalletAccountId();
+    const milestoneCount = (coin.milestones_fired || []).length;
+    const voteCount = rounds.length;
+    const battleCount = (allBattles || []).filter((b) => b.coin_id === id).length;
     el.innerHTML = `
       <div class="panel">
         <div class="top row" style="align-items:center;"><img src="${coinImg(coin.symbol)}" style="width:64px;height:64px;border-radius:50%;" alt="">
           <div><h2 style="margin:0;">${esc(coin.name)} <span class="muted">$${esc(coin.symbol)}</span> ${gradBadge(coin)}</h2>
           <div class="muted small">${esc(coin.description)}</div>
           <div class="small">Token: <a class="mono" href="${EXPLORER}/address/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="#/agent/${esc(coin.creator)}">${esc(coin.creator)}</a> · <button onclick="shareCoin(${coin.id})">Share</button></div></div></div>
+        <div class="reactive">This coin has triggered <b>${milestoneCount}</b> milestones / <b>${voteCount}</b> supply votes / <b>${battleCount}</b> battles<span>Reactive history — every milestone, vote and battle is onchain.</span></div>
         <div class="kv" style="margin-top:14px;">
           <span>Market cap</span><b>${fmtNear(coin.market_cap_yocto)} NEAR</b>
           <span>Price</span><b>${fmtNear(coin.price_per_token_yocto)} NEAR / token</b>
@@ -517,6 +522,17 @@ async function showCoin(id) {
           <div class="row"><input id="voteHours" type="number" min="1" max="168" value="24" placeholder="Duration (hours)"><button onclick="createVote(${coin.id})">Open a vote round</button></div>
         </div>
         <div class="panel">
+          <h3>Start an agent battle on this coin</h3>
+          <p class="muted small">24h window, 0.1 NEAR forfeit each, realised PnL on this coin decides the winner. The opponent accepts with their own 0.1 NEAR.</p>
+          <div class="row"><input id="battleOpponent" placeholder="Opponent agent account (e.g. holder-pac.testnet)"><button class="primary" onclick="createBattle(${coin.id})">Challenge (0.1 NEAR)</button></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:16px;">
+        <p class="kicker">Also built</p>
+        <h3 style="margin-top:0;">Bonus — also built, not the lead</h3>
+        <div class="twocol">
+        <div class="panel">
           <h3>Daily meme ritual — day ${dayIdx}</h3>
           <p class="muted small">An AI judge (NEAR AI Cloud, running in a TEE with attestation) scores each meme on humor, originality and relevance. The daily winner is picked 50% by the AI score and 50% by community votes, and wins 0.01 NEAR.</p>
           ${day && day.submissions.length ? day.submissions.map((s, i) => `
@@ -530,16 +546,13 @@ async function showCoin(id) {
           <p class="muted small">The meme text is public and is what the AI judge reads. The hash alone cannot be scored.</p>
           <button style="margin-top:8px;" onclick="resolveMeme(${coin.id}, ${dayIdx})">Resolve today (after the day ends)</button>
           ${day && day.resolved ? `<p class="small">Winner (AI 50% + community 50%): <span class="mono">${esc(day.winner_hash || '')}</span> by ${esc(day.winner || '')}</p>` : ''}
+        </div>
+        <div class="panel">
           <h3>Coin duel</h3>
           <p class="muted small">Challenge another coin to a 24h volume duel — loser pays 5% of its treasury.</p>
           <div class="row"><input id="duelOther" type="number" min="0" placeholder="Other coin id"><button onclick="createDuel(${coin.id})">Start duel</button></div>
         </div>
-      </div>
-
-      <div class="panel">
-        <h3>Start an agent battle on this coin</h3>
-        <p class="muted small">24h window, 0.1 NEAR forfeit each, realised PnL on this coin decides the winner. The opponent accepts with their own 0.1 NEAR.</p>
-        <div class="row"><input id="battleOpponent" placeholder="Opponent agent account (e.g. holder-pac.testnet)"><button class="primary" onclick="createBattle(${coin.id})">Challenge (0.1 NEAR)</button></div>
+        </div>
       </div>`;
     applyPendingCopy(coin.id);
   } catch (e) {
@@ -594,6 +607,7 @@ async function showAgent(accountId) {
           ${copyStats ? `<span>Auto copy</span><b>${copyStats.copier_count} copier(s) · ${fmtNear(copyStats.total_fees_earned_yocto)} NEAR earned in copy fees</b>` : ''}
         </div>
         ${me && me !== accountId ? `
+        <p class="kicker">Also built</p>
         <h3>Auto copy this leader</h3>
         ${myFollow ? `<p><span class="pill active">Copying</span> <span class="muted small">You copy ${fmtNear(myFollow.amount_per_trade_yocto)} NEAR per trade, max total ${fmtNear(myFollow.max_total_yocto)} NEAR, copied so far ${fmtNear(myFollow.total_copied_yocto)} NEAR.</span></p>` : '<p class="muted small">A relayer mirrors this leader for you using a key that can only call the arena copy methods. Each copy pays a 1% fee to the leader. Copied tokens sit in the arena vault until sold or withdrawn.</p>'}
         <div class="row">
