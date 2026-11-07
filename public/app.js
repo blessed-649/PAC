@@ -1,4 +1,4 @@
-// PAC demo frontend — reads via raw NEAR RPC, writes via MyNearWallet.
+// PAC demo frontend — reads via raw NEAR RPC, writes via Meteor Wallet.
 // Arena: pac-arena.testnet (NEAR testnet). All amounts in views are decimal
 // strings (yoctoNEAR or whole tokens); parse them with BigInt, never Number.
 const ARENA_ID = 'pac-arena.testnet';
@@ -66,6 +66,147 @@ function lockBadge(coin) {
   return `<span class="lock claimed">Lock claimed</span>`;
 }
 
+// ---------- graduation ----------
+// The contract has no graduation constant. The curve sells 800,000,000
+// tokens (MAX_CURVE_TOKENS); a coin graduates when 793,100,000 have sold,
+// the bot.fun graduation level the plan cites. Read only, from view data.
+const GRADUATION_SOLD_TOKENS = 793_100_000n;
+const isGraduated = (coin) => { try { return BigInt(coin.sold_tokens) >= GRADUATION_SOLD_TOKENS; } catch { return false; } };
+const gradBadge = (coin) => isGraduated(coin) ? `<span class="grad">Graduated</span>` : '';
+
+// ---------- share to X ----------
+const SITE_URL = 'https://pac-fun.vercel.app/';
+function shareText(text) {
+  window.open('https://x.com/intent/post?text=' + encodeURIComponent(text), '_blank', 'noopener');
+}
+function shareCoin(id) {
+  const c = coinsCache.find((x) => x.id === id);
+  if (!c) return;
+  shareText(`${c.name} $${c.symbol} on PAC: market cap ${fmtNear(c.market_cap_yocto)} NEAR, ${c.holders} holders, ${fmtInt(c.sold_tokens)} tokens sold. Every agent wallet is public. ${SITE_URL}`);
+}
+function shareActivity(idx) {
+  const e = activityCache[idx];
+  if (!e) return;
+  const coin = coinsCache.find((c) => c.id === e.coin_id);
+  const coinName = coin ? `${coin.name} $${coin.symbol}` : ('coin ' + e.coin_id);
+  let action;
+  if (e.kind === 'buy') action = `bought ${fmtInt(e.tokens)} tokens of ${coinName} for ${fmtNear(e.near_yocto)} NEAR`;
+  else if (e.kind === 'sell') action = `sold ${fmtInt(e.tokens)} tokens of ${coinName} for ${fmtNear(e.near_yocto)} NEAR`;
+  else action = `${e.kind} ${coinName}`;
+  shareText(`${e.agent} ${action} on PAC. Every agent wallet is public. ${SITE_URL}`);
+}
+
+// ---------- follow + watchlist (site side, localStorage) ----------
+const FOLLOWS_KEY = 'pac-follows';
+function getFollows() {
+  try { const v = JSON.parse(localStorage.getItem(FOLLOWS_KEY) || '[]'); return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []; } catch { return []; }
+}
+function setFollows(list) { try { localStorage.setItem(FOLLOWS_KEY, JSON.stringify(list)); } catch { /* storage unavailable */ } }
+function isFollowing(account) { return getFollows().includes(account); }
+function toggleFollow(account) {
+  const list = getFollows();
+  const i = list.indexOf(account);
+  if (i >= 0) list.splice(i, 1); else list.push(account);
+  setFollows(list);
+  refreshHome();
+  if (!$('view-agent').classList.contains('hidden')) showAgent(account);
+}
+function followBtn(account) {
+  return `<button class="followbtn" onclick="event.stopPropagation();toggleFollow('${esc(account)}')">${isFollowing(account) ? 'Unfollow' : 'Follow'}</button>`;
+}
+function renderWatchlist(activity) {
+  const box = $('watchlistBox');
+  if (!box) return;
+  const follows = getFollows();
+  if (!follows.length) { box.innerHTML = '<p class="muted">No agents followed yet. Follow one from the leaderboard.</p>'; return; }
+  const items = activity.slice().reverse();
+  box.innerHTML = follows.map((acct) => {
+    const trades = items.filter((e) => e.agent === acct && (e.kind === 'buy' || e.kind === 'sell')).slice(0, 5);
+    return `<div class="panel small" style="margin-bottom:8px;">
+      <div class="row"><b><a href="#/agent/${esc(acct)}">${esc(acct)}</a></b><button class="followbtn" onclick="toggleFollow('${esc(acct)}')">Unfollow</button></div>
+      ${trades.length ? `<div class="feed" style="margin-top:8px;">${trades.map((t) => {
+        const idx = items.indexOf(t);
+        const coin = coinsCache.find((c) => c.id === t.coin_id);
+        const coinName = coin ? esc(coin.name) : ('coin ' + t.coin_id);
+        return `<div class="feeditem"><div><b>${esc(t.kind)}</b> ${coinName} · ${fmtInt(t.tokens)} tokens · ${fmtNear(t.near_yocto)} NEAR</div><div class="feedactions"><button onclick="copyTrade(${idx})">Copy</button></div><span class="time">${timeAgo(t.timestamp_ns)}</span></div>`;
+      }).join('')}</div>` : '<p class="muted small">No trades in the feed yet.</p>'}
+    </div>`;
+  }).join('');
+}
+
+// ---------- manual copy ----------
+// One tap manual copy: fills in the buy or sell form on the coin page.
+// The visitor still confirms the trade in their wallet. No auto copy.
+let pendingCopy = null;
+function copyTrade(idx) {
+  const e = activityCache[idx];
+  if (!e) return;
+  pendingCopy = { coinId: e.coin_id, kind: e.kind, tokens: e.tokens, nearYocto: e.near_yocto };
+  location.hash = '#/coin/' + e.coin_id;
+}
+function applyPendingCopy(coinId) {
+  if (!pendingCopy || pendingCopy.coinId !== coinId) return;
+  const pc = pendingCopy; pendingCopy = null;
+  if (pc.kind === 'buy') {
+    const b = $('buyAmount');
+    if (b) { b.value = fmtNear(pc.nearYocto); scrollToEl(b); }
+    status('Buy form filled in from the copied trade.');
+  } else if (pc.kind === 'sell') {
+    const s = $('sellAmount');
+    if (s) { s.value = pc.tokens; scrollToEl(s); }
+    status('Sell form filled in from the copied trade.');
+  }
+}
+// Scrolling is best effort: never let it break the page.
+function scrollToEl(el) {
+  try { if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch { /* ignore */ }
+}
+
+// ---------- weekly board (site side, from the activity feed) ----------
+// Current calendar week, Monday 00:00 UTC. Weekly realised PnL is
+// estimated from the feed: sells in the week priced against the agent
+// average buy price across the whole feed.
+function weekStartMs() {
+  const now = new Date();
+  const day = (now.getUTCDay() + 6) % 7; // Monday = 0
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day, 0, 0, 0, 0);
+}
+function renderWeeklyBoard(activity) {
+  const body = $('weekBody');
+  const label = $('weekLabel');
+  if (!body) return;
+  const startNs = BigInt(weekStartMs()) * 1000000n;
+  const buys = new Map(); // agent -> { tokens, spent }
+  for (const e of activity) {
+    if (e.kind !== 'buy') continue;
+    const b = buys.get(e.agent) || { tokens: 0n, spent: 0n };
+    try { b.tokens += BigInt(e.tokens); b.spent += BigInt(e.near_yocto); } catch { continue; }
+    buys.set(e.agent, b);
+  }
+  const traded = new Map(); // agent -> trade count in the week
+  const pnl = new Map(); // agent -> realised PnL in the week, yocto
+  for (const e of activity) {
+    if (e.kind !== 'buy' && e.kind !== 'sell') continue;
+    let ts; try { ts = BigInt(e.timestamp_ns); } catch { continue; }
+    if (ts < startNs) continue;
+    traded.set(e.agent, (traded.get(e.agent) || 0) + 1);
+    if (e.kind === 'sell') {
+      const b = buys.get(e.agent) || { tokens: 0n, spent: 0n };
+      const avgCost = b.tokens > 0n ? b.spent / b.tokens : 0n;
+      let p; try { p = BigInt(e.near_yocto) - BigInt(e.tokens) * avgCost; } catch { continue; }
+      pnl.set(e.agent, (pnl.get(e.agent) || 0n) + p);
+    }
+  }
+  const rows = [...traded.keys()].map((acct) => ({ account: acct, pnl: pnl.get(acct) || 0n, trades: traded.get(acct) }));
+  rows.sort((a, b) => (b.pnl > a.pnl ? 1 : b.pnl < a.pnl ? -1 : 0));
+  if (label) label.textContent = 'Week of ' + new Date(weekStartMs()).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC).';
+  body.innerHTML = rows.length ? rows.slice(0, 20).map((r, i) => `
+    <tr onclick="location.hash='#/agent/${esc(r.account)}'">
+      <td>${i + 1}</td><td>${esc(r.account)}</td>
+      <td>${fmtNear(r.pnl.toString())} NEAR</td><td>${r.trades}</td>
+    </tr>`).join('') : '<tr><td colspan="4" class="muted">No trades this week yet.</td></tr>';
+}
+
 // ---------- RPC reads ----------
 async function rpcView(contractId, method, args) {
   const argsB64 = btoa(JSON.stringify(args));
@@ -126,6 +267,7 @@ async function walletCall(contractId, method, args, depositYocto, gas = GAS_STD)
 
 // ---------- shared state ----------
 let coinsCache = [];
+let activityCache = [];
 let paramsCache = null;
 
 async function loadParams() {
@@ -151,6 +293,8 @@ async function refreshHome() {
     renderActivity(activity);
     renderBattles(battles, duels);
     renderLeaderboard(coins, activity);
+    renderWeeklyBoard(activity);
+    renderWatchlist(activity);
     const params = await loadParams();
     $('paramsBox').innerHTML = `
       <div class="kv">
@@ -161,6 +305,7 @@ async function refreshHome() {
         <span>Supply votes</span><b>holders vote by holdings, one vote each · ${params.vote_choices.join(' / ')} · burn/mint ${params.vote_burn_bp / 100}% of supply · ${params.vote_min_duration_hours}–${params.vote_max_duration_hours}h rounds</b>
         <span>Coin duels</span><b>${params.coin_duel_duration_hours}h on trading volume · loser pays ${params.coin_duel_treasury_bp / 100}% of its NEAR treasury</b>
         <span>Daily meme ritual</span><b>every ${params.meme_day_hours}h holders submit a meme hash, community votes, winner stored onchain, submitter earns ${fmtNear(params.meme_reward_yocto)} NEAR from the treasury</b>
+        <span>Graduation</span><b>a coin graduates at 793,100,000 tokens sold on the curve (bot.fun level); the card shows a Graduated badge</b>
         <span>Launch cost</span><b>${fmtNear(params.launch_cost_yocto)} NEAR + initial buy (min ${fmtNear(params.min_initial_buy_yocto)} NEAR)</b>
       </div>`;
   } catch (e) {
@@ -180,18 +325,22 @@ function renderCoins(coins) {
       <div class="nums"><span>Price</span><b>${fmtNear(c.price_per_token_yocto)} NEAR / token</b></div>
       <div class="nums"><span>Holders</span><b>${c.holders}</b></div>
       <div class="nums"><span>Sold</span><b>${fmtInt(c.sold_tokens)} / ${fmtInt(c.curve_cap_tokens)}</b></div>
-      ${lockBadge(c)}
+      ${lockBadge(c)} ${gradBadge(c)}
+      <div class="actions"><button onclick="event.stopPropagation();shareCoin(${c.id})">Share</button></div>
     </div>`).join('');
 }
 
 function renderActivity(activity) {
   const list = $('feedList');
-  if (!activity.length) { list.innerHTML = '<p class="muted">No activity yet.</p>'; return; }
-  list.innerHTML = activity.slice().reverse().map((e) => {
+  const items = activity.slice().reverse();
+  activityCache = items;
+  if (!items.length) { list.innerHTML = '<p class="muted">No activity yet.</p>'; return; }
+  list.innerHTML = items.map((e, i) => {
     const coin = coinsCache.find((c) => c.id === e.coin_id);
     const img = coin ? coinImg(coin.symbol) : coinImg('?');
     const coinName = coin ? esc(coin.name) : ('coin ' + e.coin_id);
-    return `<div class="feeditem"><img src="${img}" alt=""><div><b><a href="#/agent/${esc(e.agent)}">${esc(e.agent)}</a></b> ${esc(e.kind)} <b>${coinName}</b> <span class="muted">${esc(e.note || '')}</span></div><span class="time">${timeAgo(e.timestamp_ns)}</span></div>`;
+    const canCopy = e.kind === 'buy' || e.kind === 'sell';
+    return `<div class="feeditem"><img src="${img}" alt=""><div><b><a href="#/agent/${esc(e.agent)}">${esc(e.agent)}</a></b> ${esc(e.kind)} <b>${coinName}</b> <span class="muted">${esc(e.note || '')}</span></div><div class="feedactions"><button onclick="shareActivity(${i})">Share</button>${canCopy ? `<button onclick="copyTrade(${i})">Copy</button>` : ''}</div><span class="time">${timeAgo(e.timestamp_ns)}</span></div>`;
   }).join('');
 }
 
@@ -222,7 +371,7 @@ async function renderLeaderboard(coins, activity) {
   rows.sort((a, b) => (b.score - a.score) || (BigInt(b.realised_pnl_yocto) > BigInt(a.realised_pnl_yocto) ? 1 : -1));
   $('leaderBody').innerHTML = rows.length ? rows.slice(0, 20).map((a, i) => `
     <tr onclick="location.hash='#/agent/${esc(a.account)}'">
-      <td>${i + 1}</td><td>${esc(a.account)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''}</td>
+      <td>${i + 1}</td><td>${esc(a.account)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''} ${followBtn(a.account)}</td>
       <td class="score">${a.score}<span class="band ${a.band}">${esc(a.band)}</span></td>
       <td>${fmtNear(a.realised_pnl_yocto)} NEAR</td><td>${(a.win_rate_bp / 100).toFixed(1)}%</td>
       <td>${a.avg_hold_hours}h</td><td>${a.battles_won}/${a.battles_played}</td>
@@ -250,14 +399,15 @@ async function showCoin(id) {
     el.innerHTML = `
       <div class="panel">
         <div class="top row" style="align-items:center;"><img src="${coinImg(coin.symbol)}" style="width:64px;height:64px;border-radius:50%;" alt="">
-          <div><h2 style="margin:0;">${esc(coin.name)} <span class="muted">$${esc(coin.symbol)}</span></h2>
+          <div><h2 style="margin:0;">${esc(coin.name)} <span class="muted">$${esc(coin.symbol)}</span> ${gradBadge(coin)}</h2>
           <div class="muted small">${esc(coin.description)}</div>
-          <div class="small">Token: <a class="mono" href="${EXPLORER}/address/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="#/agent/${esc(coin.creator)}">${esc(coin.creator)}</a></div></div></div>
+          <div class="small">Token: <a class="mono" href="${EXPLORER}/address/${esc(coin.token_id)}" target="_blank" rel="noopener">${esc(coin.token_id)}</a> · Creator: <a href="#/agent/${esc(coin.creator)}">${esc(coin.creator)}</a> · <button onclick="shareCoin(${coin.id})">Share</button></div></div></div>
         <div class="kv" style="margin-top:14px;">
           <span>Market cap</span><b>${fmtNear(coin.market_cap_yocto)} NEAR</b>
           <span>Price</span><b>${fmtNear(coin.price_per_token_yocto)} NEAR / token</b>
           <span>Holders</span><b>${coin.holders}</b>
           <span>Sold</span><b>${fmtInt(coin.sold_tokens)} / ${fmtInt(coin.curve_cap_tokens)} (cap grows +${fmtInt(params.milestone_tranche_tokens)} at 50 holders)</b>
+          <span>Graduation</span><b>${isGraduated(coin) ? 'Graduated — sold past 793,100,000 tokens' : fmtInt(coin.sold_tokens) + ' of 793,100,000 sold to graduate'}</b>
           <span>Supply</span><b>${fmtInt(coin.total_supply_tokens)} total · ${fmtInt(coin.burned_tokens)} burned</b>
           <span>Treasury</span><b>${fmtNear(coin.near_reserve_yocto)} NEAR</b>
           <span>Milestones fired</span><b>${coin.milestones_fired.length ? coin.milestones_fired.join(', ') + ' holders' : 'none yet'}</b>
@@ -306,6 +456,7 @@ async function showCoin(id) {
         <p class="muted small">24h window, 0.1 NEAR forfeit each, realised PnL on this coin decides the winner. The opponent accepts with their own 0.1 NEAR.</p>
         <div class="row"><input id="battleOpponent" placeholder="Opponent agent account (e.g. holder-pac.testnet)"><button class="primary" onclick="createBattle(${coin.id})">Challenge (0.1 NEAR)</button></div>
       </div>`;
+    applyPendingCopy(coin.id);
   } catch (e) {
     console.error(e);
     el.innerHTML = '<p>Failed to load coin: ' + esc(String(e.message).slice(0, 200)) + '</p>';
@@ -334,7 +485,7 @@ async function showAgent(accountId) {
     }
     el.innerHTML = `
       <div class="panel">
-        <h2 style="margin-top:0;">${esc(accountId)}</h2>
+        <h2 style="margin-top:0;">${esc(accountId)} <button class="followbtn" onclick="toggleFollow('${esc(accountId)}')">${isFollowing(accountId) ? 'Unfollow' : 'Follow'}</button></h2>
         <div class="kv">
           <span>Reputation</span><b class="score">${agent.score} / 1000 <span class="band ${agent.band}">${esc(agent.band)}</span>${agent.rugged ? ' <span class="band rugged">RUGGED</span>' : ''}</b>
           <span>Realised PnL</span><b>${fmtNear(agent.realised_pnl_yocto)} NEAR</b>

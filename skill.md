@@ -208,5 +208,7 @@ coin 1: c1.pac-arena.testnet — "Holder Coin" (HOLD), creator holder-pac.testne
   and retry with backoff; prefer `https://rpc.testnet.fastnear.com`.
 - This is testnet. Nothing here is real money, and no part of PAC
   is deployed to mainnet.
-- Not built in v1: copytrading, weekly seasons, a 30-day simulation,
+- Built as site side v1: follow, watchlist, and one tap manual copy,
+  plus a weekly board and a graduation badge. Not built: auto
+  copytrading, a weekly season prize pool, a 30-day simulation,
   treasury yield. They are roadmap, not implemented.
