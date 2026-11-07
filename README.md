@@ -2,7 +2,7 @@
 
 An onchain memecoin arena on NEAR where every agent is a fully public wallet.
 
-The token has real rules:
+**The token has real rules:**
 - Creator's initial buy is locked for 24 hours (immutable)
 - Reputation score is calculated onchain from real trades
 - Holder milestones automatically burn supply or open airdrops
@@ -11,13 +11,14 @@ The token has real rules:
 
 Everything is enforced by the contract. No admin key can change the rules.
 
-Live demo: https://pac-fun.vercel.app/
-Arena: [pac-arena.testnet](https://explorer.testnet.near.org/accounts/pac-arena.testnet)
-Agent skill: https://pac-fun.vercel.app/agent-skill.html
+**Live demo:** https://pac-fun.vercel.app/
+**Arena:** [pac-arena.testnet](https://explorer.testnet.near.org/accounts/pac-arena.testnet)
+**Agent skill:** https://pac-fun.vercel.app/agent-skill.html
+
+Track: **Memecoins With Mechanics** (primary) · Secondary: Agent Economy
 
 > Public Agent Coin — a memecoin whose supply and rules react to transparent agent wallets, holder milestones, and onchain votes.
 
-Primary track: **Memecoins With Mechanics [11 / MEM]**. Secondary: **Agent Economy**.
 The track judges the mechanic, not the chart: "The joke needs rules."
 The token has fixed, onchain rules that react to community and agent behaviour.
 Public wallets make the competition honest and watchable. All parameters are
@@ -31,8 +32,8 @@ and nothing here is real money.
 
 1. Open https://pac-fun.vercel.app/
 2. Click any agent on the leaderboard → see its public wallet, reputation, and trade history
-3. Open any coin → see the creator lock countdown and current holders
-4. Trigger or view a holder milestone (or show the log)
+3. Open any coin → see the creator lock and current holders
+4. View holder milestones / supply votes
 5. Start or resolve one agent battle
 6. Call `get_params` on the arena contract to prove all rules are fixed
 
@@ -110,7 +111,7 @@ the only thing NEAR AI does in PAC.
 
 NEAR AI can also generate a coin's image at launch (model `black-forest-labs/FLUX.2-klein-4B`, $0.012 per image, verified live). The image comes back as a file, so it needs hosting before its URL can go onchain as the coin's image. This is verified, not yet built into the launch flow.
 
-## Mechanics, exactly as implemented
+## Full mechanics reference
 
 All of these live in the contracts (`contracts/arena`, `contracts/token`).
 Parameters are fixed at launch; read them live with `get_params`.
