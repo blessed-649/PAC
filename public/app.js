@@ -245,43 +245,96 @@ async function rpcView(contractId, method, args) {
 }
 const view = (method, args = {}) => rpcView(ARENA_ID, method, args);
 
-// ---------- wallet ----------
-let wallet = null;
-let nearConn = null;
-async function initWallet() {
-  if (!window.nearApi) { console.warn('near-api-js failed to load; wallet actions unavailable'); return; }
+// ---------- wallet (@fastnear/wallet 2.5.0, same as VeilProof) ----------
+// VeilProof's connect works on the user's phone: the library opens a
+// wallet selector, and on mobile it deep links into the installed
+// Meteor app, where the account already lives. The old near-api-js
+// WalletConnection did a full page redirect to the Meteor web wallet,
+// which has no account stored on a phone, so it landed on the create
+// wallet screen and could never connect. Meteor stays the wallet;
+// only the connect mechanism changes. PAC signs no messages, so the
+// Meteor nonce issue VeilProof fixed does not apply here.
+const NETWORK = 'testnet';
+let walletAccountId = null;
+function fastnear() {
+  if (typeof window.nearWallet === 'undefined') {
+    throw new Error('FastNear wallet library not loaded. Check the script tag.');
+  }
+  return window.nearWallet;
+}
+function currentAccountId(nw) {
   try {
-    const keyStore = new nearApi.keyStores.BrowserLocalStorageKeyStore();
-    nearConn = await nearApi.connect({
-      networkId: 'testnet', nodeUrl: RPC_URL,
-      walletUrl: 'https://wallet.meteorwallet.app/',
-      helperUrl: 'https://helper.testnet.near.org', keyStore,
-    });
-    wallet = new nearApi.WalletConnection(nearConn, 'pac-demo');
-    refreshWalletBtn();
-  } catch (e) { console.warn('wallet init failed', e); }
+    const id = nw.accountId({ network: NETWORK });
+    return typeof id === 'string' && id ? id : null;
+  } catch (_) {
+    return null;
+  }
+}
+function getWalletAccountId() { return walletAccountId; }
+async function initWallet() {
+  try {
+    const nw = fastnear();
+    const restored = await nw.restore({ network: NETWORK });
+    const id = (restored && typeof restored.accountId === 'string' && restored.accountId) || currentAccountId(nw);
+    if (id) walletAccountId = id;
+  } catch (e) { console.warn('wallet restore failed', e); }
+  // Clean the wallet return params off the URL, keeping the route.
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('transactionHashes')) {
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+    }
+  } catch (_) { /* ignore */ }
+  refreshWalletBtn();
 }
 function refreshWalletBtn() {
   const btn = $('connectBtn');
-  if (!wallet) { btn.textContent = 'Wallet unavailable'; btn.disabled = true; return; }
-  const id = wallet.getAccountId();
+  if (!btn) return;
+  let libOk = true;
+  try { fastnear(); } catch (_) { libOk = false; }
+  if (!libOk) { btn.textContent = 'Wallet unavailable'; btn.disabled = true; return; }
+  const id = walletAccountId;
   btn.textContent = id ? id + ' (sign out)' : 'Connect wallet';
   btn.disabled = false;
 }
 function requireWallet() {
-  if (!wallet) { status('Wallet library did not load — check your connection and reload.'); return null; }
-  const id = wallet.getAccountId();
+  const id = walletAccountId;
   if (!id) { status('Connect your testnet wallet first (top right).'); return null; }
   return id;
 }
 async function toggleWallet() {
-  if (!wallet) return;
-  if (wallet.getAccountId()) { wallet.signOut(); refreshWalletBtn(); status('Signed out.'); }
-  else { wallet.requestSignIn({ contractId: ARENA_ID }); }
+  let nw;
+  try { nw = fastnear(); } catch (_) { status('Wallet library did not load — check your connection and reload.'); return; }
+  try {
+    if (walletAccountId) {
+      try { await nw.disconnect({ network: NETWORK }); } catch (_) {}
+      walletAccountId = null;
+      refreshWalletBtn();
+      status('Signed out.');
+      return;
+    }
+    status('Opening wallet selector…', 3000);
+    const result = await nw.connect({ network: NETWORK });
+    const id = (result && typeof result.accountId === 'string' && result.accountId) || currentAccountId(nw);
+    if (typeof id !== 'string' || !id) { status('Could not determine the connected account. Try again.'); return; }
+    walletAccountId = id;
+    refreshWalletBtn();
+    status('Connected as ' + id + '.');
+  } catch (e) { status('Wallet error: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function walletCall(contractId, method, args, depositYocto, gas = GAS_STD) {
-  const account = wallet.account();
-  return account.functionCall({ contractId, methodName: method, args, gas, attachedDeposit: depositYocto });
+  const nw = fastnear();
+  return nw.sendTransaction({
+    receiverId: contractId,
+    network: NETWORK,
+    actions: [{
+      type: 'FunctionCall',
+      methodName: method,
+      args,
+      gas: gas.toString(),
+      deposit: depositYocto.toString(),
+    }],
+  });
 }
 
 // ---------- shared state ----------
@@ -372,7 +425,7 @@ function renderBattles(battles, duels) {
     <div class="panel small" style="margin-bottom:8px;">
       <div class="row"><b>Battle ${b.id}</b><span class="pill ${b.status}">${esc(b.status)}</span><span class="muted">${esc(b.agent_a)} vs ${esc(b.agent_b)}</span></div>
       <div class="muted small">Coin ${b.coin_id} · forfeit ${fmtNear(b.forfeit_yocto)} NEAR · ends ${fmtTime(b.end_ns)}${b.winner ? ' · winner: ' + esc(b.winner) : ''}</div>
-      ${b.status === 'active' && wallet && wallet.getAccountId() === b.agent_b ? `<button onclick="acceptBattle(${b.id})">Accept (0.1 NEAR)</button>` : ''}
+      ${b.status === 'active' && getWalletAccountId() === b.agent_b ? `<button onclick="acceptBattle(${b.id})">Accept (0.1 NEAR)</button>` : ''}
       ${b.status === 'active' ? `<button onclick="resolveBattle(${b.id})">Resolve</button>` : ''}
     </div>`).join('') : '<p class="muted">No battles yet.</p>';
   $('duelList').innerHTML = duels.length ? duels.slice().reverse().map((d) => `
@@ -421,7 +474,7 @@ async function showCoin(id) {
     if (!coin) { el.innerHTML = '<p>Coin not found.</p>'; return; }
     const dayIdx = Math.floor((Date.now() - Number(BigInt(coin.created_at_ns) / 1000000n)) / 86400000);
     const day = dayIdx === 0 ? memeDay : await view('get_meme_day', { coin_id: id, day: dayIdx }).catch(() => null);
-    const me = wallet ? wallet.getAccountId() : null;
+    const me = getWalletAccountId();
     el.innerHTML = `
       <div class="panel">
         <div class="top row" style="align-items:center;"><img src="${coinImg(coin.symbol)}" style="width:64px;height:64px;border-radius:50%;" alt="">
@@ -510,7 +563,7 @@ async function showAgent(accountId) {
       } catch { /* skip */ }
     }
     const copyStats = await view('get_copy_stats', { leader: accountId }).catch(() => null);
-    const me = wallet ? wallet.getAccountId() : null;
+    const me = getWalletAccountId();
     const myFollow = (me && me !== accountId) ? await view('get_follow', { copier: me, leader: accountId }).catch(() => null) : null;
     const myCopyPositions = [];
     if (me && me !== accountId) {
