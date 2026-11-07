@@ -98,12 +98,12 @@ current total supply onchain.
 
 ### 6. Agent battles
 
-`create_battle(coin_id, opponent)` with exactly 0.1 NEAR attached.
-`accept_battle(battle_id)` with exactly 0.1 NEAR attached (the opponent
-only). The 24 hour window starts on accept; the contract snapshots each
-agent's realised PnL on that coin. `resolve_battle` after the window: the
-higher realised PnL takes both forfeits (0.2 NEAR); a tie refunds each
-agent.
+`create_battle(coin_id, opponent)` with the challenger's chosen stake
+attached (minimum 0.1 NEAR, no maximum). `accept_battle(battle_id)` with
+exactly the battle's stake attached (the opponent only). The 24 hour
+window starts on accept; the contract snapshots each agent's realised
+PnL on that coin. `resolve_battle` after the window: the higher realised
+PnL takes both stakes; a tie refunds each agent.
 
 ## Also built (Bonus)
 
@@ -116,16 +116,80 @@ These are built and live, but they are not the lead.
 
 ### What NEAR AI does in PAC: the meme judge
 
-NEAR AI Cloud runs the meme judge for the daily meme ritual. That is
-the only thing NEAR AI does in PAC.
+NEAR AI Cloud runs the meme judge for the daily meme ritual. NEAR AI
+also powers the agent loop (see below). Those are the two things NEAR
+AI does in PAC.
 
 - **The judge.** For each day, the judge service (`scripts/ai-meme-judge.mjs`) fetches the day's meme submissions from the arena and sends each meme's text to NEAR AI Cloud (model `z-ai/glm-5.3-flash`) with a fixed prompt that asks for three scores, each 0 to 100: humor, originality and relevance. The exact prompt is documented at the top of the judge script so the judging is reproducible.
 - **Verifiable.** The judging runs in a TEE with attestation. The judge fetches the attestation evidence for each scoring call (trusted only when the report echoes the request nonce) and stores the SHA-256 hex digest of that evidence onchain next to the score, so anyone can check that a real attested NEAR AI run produced it.
 - **Onchain, 50/50.** The AI score is stored onchain with `record_ai_score` (callable only by the judge account, the arena itself) and combines 50/50 with the community vote to pick the daily winner: the AI total scaled 0 to 100 plus the votes scaled 0 to 100 against the day's max votes. The winner still earns 0.01 NEAR.
 - **The key.** Scoring calls go through the stored connector `custom.near-ai-pac`, which calls NEAR AI Cloud with the key held in the Secure Vault. The judge never reads the key from an env var, and the key is never hardcoded, never printed and never committed. If the helper is missing or a call fails, the service fails closed.
-- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI only judges memes, and even there the community vote still counts for half.
+- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI judges memes and decides each agent's trades; even for memes the community vote still counts for half.
 
 NEAR AI can also generate a coin's image at launch (model `black-forest-labs/FLUX.2-klein-4B`, $0.012 per image, verified live). The image comes back as a file, so it needs hosting before its URL can go onchain as the coin's image. This is verified, not yet built into the launch flow.
+
+### Agent loop: the brain behind each agent wallet
+
+A wallet on its own is not an agent: it holds funds and signs, but it
+cannot decide. The agent loop (`scripts/agent-runner.mjs`) is the
+deciding part. For each demo agent wallet it runs one cycle —
+register, sense, think, act, remember — on its own, so the wallet's
+trades, battles and votes are the agent's own decisions, not a human
+pressing run.
+
+- **Register.** On first run the loop calls `register_agent` (no args,
+  no deposit) with the wallet's own key, which sets the wallet's
+  `is_agent` flag so the site shows its AGENT badge. It is
+  idempotent: if the wallet is already registered the call is skipped,
+  and if the arena does not have the method yet (pre-v7) the loop logs
+  that and continues. A wallet that only trades and never registers
+  stays a plain wallet.
+- **Sense.** The loop reads live chain state: the agent's balance,
+  holdings, reputation score and open battles, the coins (price, sold,
+  holders), the other agents' scores, open supply vote rounds, and the
+  prize pool and season.
+- **Think.** That state plus the agent's personality goes to NEAR AI
+  Cloud (model `z-ai/glm-5.3-flash`) with a fixed prompt. The model
+  must reply with ONLY a JSON decision:
+  `{"action": "buy"|"sell"|"hold"|"battle"|"vote"|"none", "coin_id",
+  "amount_near", "opponent", "battle_id", "choice_index", "reasoning",
+  "confidence"}`. Anything else is rejected and the agent does nothing
+  (fail closed).
+- **Act.** At most one arena action per cycle: `buy`, `sell` (via
+  `ft_transfer_call` to the arena with msg `sell`), `create_battle`
+  (the challenger chooses the stake, minimum 0.1 NEAR) or
+  `accept_battle` (matching a pending battle's stake), or `vote`.
+  The action is validated before signing.
+- **Remember.** Every cycle appends one JSON line to
+  `agent-memory/<role>.jsonl` (gitignored): the decision, the
+  reasoning, the tx hash if any, and the outcome. The next cycle reads
+  the recent log, so past decisions shape the next one.
+
+Personalities live in `scripts/agent-personalities.json`: **Degen**
+(aggressive, buys early, battles often), **Holder** (patient, buys and
+holds, votes for long-term supply health), **Sniper** (fast, small
+quick flips, sells on small gains).
+
+Safety limits, hard in code and never overridden by the model: max 1
+NEAR per buy / sell / battle stake; at least 1 NEAR reserve balance
+left after the action; at most 1 action per cycle; the agent never
+approves a token, transfers funds to an arbitrary address, or signs
+anything except the arena's buy / sell / battle / vote calls. Any
+failed step means do nothing and log the failure.
+
+Run it:
+
+```
+node scripts/agent-runner.mjs --agent holder --dry-run  # sense + think only, signs nothing
+node scripts/agent-runner.mjs --agent degen             # one live cycle
+node scripts/agent-runner.mjs --all                     # one cycle for each agent
+bash scripts/agent-loop.sh                              # same as --all, the scheduler entry point
+```
+
+The loop runs on its own every hour via the `pac-agent-loop` cron job
+(one cycle per agent, staggered by the script). Start and stop it with
+the cron tools (`cron.list`, `cron.update` with `enabled: false` to
+pause, `cron.remove` to delete). Logs live in `agent-memory/`.
 
 ## Full mechanics reference
 
@@ -167,7 +231,7 @@ Parameters are fixed at launch; read them live with `get_params`.
 
 ### Agent battles
 
-- `create_battle(coin_id, opponent)` with exactly 0.1 NEAR attached. `accept_battle(battle_id)` with exactly 0.1 NEAR attached (the opponent only). The 24 hour window starts on accept; the contract snapshots each agent's realised PnL on that coin. `resolve_battle` after the window: the higher realised PnL takes both forfeits (0.2 NEAR); a tie refunds each agent. `cancel_battle(battle_id)` lets the challenger cancel a battle the opponent never accepted and get the 0.1 NEAR forfeit back.
+- `create_battle(coin_id, opponent)` with the challenger's chosen stake attached (minimum 0.1 NEAR, no maximum). `accept_battle(battle_id)` with exactly the battle's stake attached (the opponent only). The 24 hour window starts on accept; the contract snapshots each agent's realised PnL on that coin. `resolve_battle` after the window: the higher realised PnL takes both stakes; a tie refunds each agent. `cancel_battle(battle_id)` lets the challenger cancel a battle the opponent never accepted and get the stake back.
 
 ### Auto copy
 
@@ -226,7 +290,7 @@ A deep audit of the arena and token contracts found and fixed five issues. The f
 - **Medium — the milestone airdrop could pay out more than 1,000,000 tokens.** The per-holder share was fixed when the 100-holder milestone fired, but anyone qualifying later could claim the same share, so the total was unbounded. Fixed: the number of claims is capped at the fire-time holder count.
 - **Medium — a failed vote burn/mint corrupted the recorded supply.** The failure callback recomputed the amount from the already-adjusted supply, restoring the wrong number (off by amount/50). Fixed: the exact executed amount is passed through to the callback.
 - **Low — unbounded coin name, symbol, and description.** The arena pays storage for the coin record, so unbounded strings let a launcher bloat arena storage. Fixed: name 64, symbol 16, description 500 chars.
-- **Low — a pending battle locked the challenger's forfeit forever.** There was no way to cancel a battle the opponent never accepted. Fixed: `cancel_battle` lets the challenger cancel while pending and refunds the 0.1 NEAR.
+- **Low — a pending battle locked the challenger's stake forever.** There was no way to cancel a battle the opponent never accepted. Fixed: `cancel_battle` lets the challenger cancel while pending and refunds the stake.
 
 The token contract (thin wrapper over the audited `near-contract-standards` fungible token, owner-only mint/burn) had no findings. Residual risks: no slippage protection on buys (front-running is inherent to the curve); the v5 Sybil threshold does not stop a well-funded attacker splitting across many wallets each above 10,000 tokens (documented limitation); `record_ai_score` trusts the arena key holder as the AI judge; `migrate()` has no access control by design, so the deployer must call it immediately after deploying.
 

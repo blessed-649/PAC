@@ -6,3 +6,4 @@ contracts/arena/token.wasm
 .DS_Store
 copy-relayer.config.json
 .copy-relayer-state.json
+agent-memory/
