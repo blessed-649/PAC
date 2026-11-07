@@ -588,6 +588,9 @@ pub struct ParamsView {
     pub season_duration_ns: u64,
     pub season_duration_days: u64,
     pub season_top_shares_bp: Vec<u128>,
+    /// Contract schema version (v6). Lets anyone confirm which
+    /// contract code is live without reading the WASM.
+    pub schema_version: u32,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -1181,6 +1184,15 @@ pub struct Contract {
     /// drawdown. Kept in its own collection (prefix "r") so the v4
     /// AgentStats map deserialises unchanged. Starts empty at v5.
     agent_rep: LookupMap<AccountId, AgentRep>,
+    // --- v6 field (appended after the v5 fields) ---
+    /// Contract schema version. Set to 6 by new() and by migrate().
+    /// It makes migrate() one-shot: the v6 state carries this field,
+    /// so a second migrate() (which reads state as the v5 OldContract,
+    /// without this field) fails on the trailing Borsh bytes instead
+    /// of silently re-copying the state. Without it, the second
+    /// migrate() would succeed as a no-op, because the v6 layout is
+    /// otherwise identical to v5.
+    schema_version: u32,
 }
 
 /// The v5 coin record, kept verbatim so migrate() can deserialise the
@@ -1287,6 +1299,7 @@ impl Contract {
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
+            schema_version: 6,
         }
     }
 
@@ -1369,6 +1382,7 @@ impl Contract {
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
             agent_rep: old.agent_rep,
+            schema_version: 6,
         }
     }
 
@@ -3259,6 +3273,7 @@ impl Contract {
             season_duration_ns: SEASON_DURATION_NS,
             season_duration_days: 7,
             season_top_shares_bp: SEASON_TOP_SHARES_BP.to_vec(),
+            schema_version: self.schema_version,
         }
     }
 
