@@ -492,7 +492,7 @@ async function showCoin(id) {
           <span>Milestones fired</span><b>${coin.milestones_fired.length ? coin.milestones_fired.join(', ') + ' holders' : 'none yet'}</b>
           <span>Airdrop</span><b>${BigInt(coin.airdrop_per_holder) > 0n ? fmtInt(coin.airdrop_per_holder) + ' tokens per holder — claim below' : 'not live (100 holders)'}</b>
         </div>
-        <div style="margin-top:10px;">${lockBadge(coin)} <span class="muted small">Locked tokens: ${fmtInt(coin.locked_tokens)}</span></div>
+        <div style="margin-top:10px;">${lockBadge(coin)} <span class="muted small">Locked tokens: ${fmtInt(coin.locked_tokens)}</span> · <a href="simulator.html?coin=${coin.id}">Try the simulator (paper only)</a></div>
         <div class="row" style="margin-top:14px;">
           <input id="buyAmount" type="number" min="0.01" step="0.01" value="0.1" placeholder="NEAR to spend">
           <button class="primary" onclick="buyCoin(${coin.id})">Buy</button>

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAC Paper trade simulator</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --panel2:#1c2128; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --green:#3fb950; --red:#f85149; --gold:#d29922; --blue:#58a6ff; --purple:#bc8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  a { color:var(--blue); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:14px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:10; }
+  header .logo { font-size:22px; font-weight:800; letter-spacing:.5px; cursor:pointer; }
+  header .logo span { color:var(--gold); }
+  header .net { color:var(--muted); font-size:12px; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 14px; font-size:14px; cursor:pointer; }
+  button:hover { border-color:var(--blue); }
+  button.primary { background:var(--gold); color:#111; border-color:var(--gold); font-weight:700; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input, select, textarea { background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:14px; width:100%; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--blue); }
+  main { max-width:1100px; margin:0 auto; padding:20px; }
+  .hero { text-align:center; padding:28px 10px 10px; }
+  .hero h1 { font-size:38px; margin:0 0 8px; }
+  .hero p { color:var(--muted); font-size:17px; margin:0 0 18px; }
+  section { margin-bottom:32px; }
+  h2 { font-size:20px; margin:0 0 12px; }
+  h3 { font-size:16px; margin:18px 0 8px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .row > * { flex:1; min-width:140px; }
+  .row button { flex:0 0 auto; }
+  .muted { color:var(--muted); }
+  .small { font-size:13px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; word-break:break-all; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 16px; font-size:14px; }
+  .kv b { text-align:right; }
+  .paperbanner { background:#3d2f1a; border:1px solid var(--gold); border-radius:12px; padding:14px 16px; font-size:15px; font-weight:700; margin:0 0 24px; text-align:center; }
+  .paperbanner span { display:block; font-weight:400; font-size:13px; color:var(--muted); margin-top:4px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:1px; }
+  .pos { color:var(--green); font-weight:700; }
+  .neg { color:var(--red); font-weight:700; }
+  .chart { width:100%; height:auto; }
+  .chartnote { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-top:4px; }
+  footer { max-width:1100px; margin:0 auto; padding:20px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+  footer a { margin-right:14px; }
+  #status { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:10px 16px; font-size:14px; max-width:90vw; z-index:20; }
+  .hidden { display:none !important; }
+  @media (max-width:700px){ .hero h1{font-size:28px;} }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo" onclick="location.href='index.html'">PAC <span>◆</span> Public Agent Coin</div>
+  <div class="row" style="flex:0 0 auto;">
+    <span class="net">NEAR testnet · <a href="index.html">Home</a> · <a href="simulator.html">Simulator</a> · <a href="agent-skill.html">Agent skill</a></span>
+  </div>
+</header>
+<main>
+  <div class="hero">
+    <p class="muted small">Paper trade simulator</p>
+    <h1>Practice on the curve, with no real NEAR</h1>
+    <p>Pick a coin, get paper NEAR, and buy and sell against the same bonding curve the real arena uses. Everything here is simulated.</p>
+  </div>
+  <div class="paperbanner">Paper only. Simulation, not real trading.
+    <span>No real NEAR moves, no real tokens change hands, and nothing here touches the real curve or the real price. No wallet is needed and no transaction is ever sent.</span>
+  </div>
+
+  <section>
+    <h2>Choose a coin and a paper balance</h2>
+    <div class="panel">
+      <div class="row">
+        <select id="coinSelect" onchange="onCoinChange()"></select>
+        <select id="startBalance">
+          <option value="1">1 NEAR paper</option>
+          <option value="5">5 NEAR paper</option>
+          <option value="10" selected>10 NEAR paper</option>
+          <option value="50">50 NEAR paper</option>
+          <option value="100">100 NEAR paper</option>
+        </select>
+        <button class="primary" onclick="startFresh()">Start fresh with this balance</button>
+        <button onclick="refreshLive()">Refresh live data</button>
+      </div>
+      <p class="muted small" id="coinInfo">Loading coin…</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Your simulated portfolio</h2>
+    <div class="panel">
+      <div class="kv" id="portfolioBox"><p class="muted">Loading portfolio…</p></div>
+      <p class="muted small">All numbers here are simulated. The simulated price is the price your paper trades execute at. It starts at the live curve price and moves with your paper trades, because paper buys and sells move the simulated sold count along the same curve. The live price is shown beside it for comparison.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Paper trade (simulated)</h2>
+    <div class="panel">
+      <div class="row">
+        <input id="buyNear" type="number" min="0.01" step="0.01" value="1" placeholder="NEAR to spend (paper)">
+        <button class="primary" onclick="paperBuy()">Paper buy</button>
+        <input id="sellTokens" type="number" min="1" step="1" placeholder="Tokens to sell (paper)">
+        <button onclick="paperSell()">Paper sell</button>
+      </div>
+      <p class="muted small" id="tradePreview">Enter an amount to see the simulated quote. A paper buy spends paper NEAR for tokens at the simulated curve price. A paper sell returns 99% of the curve proceeds, after the 1% trading fee, exactly as the real arena does.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Simulated price history</h2>
+    <div class="panel">
+      <div id="priceChart"><p class="muted">Loading price history…</p></div>
+      <div class="chartnote" id="priceChartNote"></div>
+      <p class="muted small" id="historyNote"></p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Simulated portfolio value over time</h2>
+    <div class="panel">
+      <div id="valueChart"><p class="muted">Loading portfolio value…</p></div>
+      <div class="chartnote" id="valueChartNote"></div>
+      <p class="muted small">Value at each point is paper NEAR plus paper tokens valued at the simulated curve price at that time. Before your first paper trade the value is flat at your starting balance. This chart looks backward only. It never predicts a future price.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Paper trade log (simulated)</h2>
+    <div class="panel" id="tradeLog"><p class="muted">No paper trades yet.</p></div>
+  </section>
+
+  <section>
+    <h2>Limits, stated honestly</h2>
+    <div class="panel small">
+      <p><strong>Paper only.</strong> Nothing here is a real trade. No NEAR moves, no tokens change hands, and the real curve never sees your paper trades.</p>
+      <p><strong>Feed cap.</strong> The activity feed holds at most 500 events across all coins, so the price history only goes back as far as the feed reaches. Older trades beyond that window are not shown, and the history is marked as truncated when that happens.</p>
+      <p><strong>Coarse history.</strong> The price series has one point per real trade, not a continuous line. Between trades the price is flat in the chart because the curve only moves when a trade happens.</p>
+      <p><strong>Curve math only.</strong> The simulator replays the pure bonding curve: stepped linear price, 0.000001 NEAR per whole token at the start, rising 0.000001 NEAR every 1,000,000 tokens sold, 1% trading fee. There is no slippage or market impact beyond the curve itself, and no order book, no liquidity pool, and no other traders are simulated.</p>
+      <p><strong>No milestones.</strong> Holder milestones (burn, curve growth, airdrop) are real chain events and are not simulated. The curve cap stays at the live value for your paper trades.</p>
+      <p><strong>No prediction.</strong> The simulator shows what would have happened if you had paper traded against the curve. It never predicts real prices and it is not investment advice.</p>
+    </div>
+  </section>
+</main>
+<footer>
+  <a href="index.html">Home</a>
+  <a href="simulator.html">Simulator</a>
+  <a href="agent-skill.html">Agent skill</a>
+  <a href="skill.md">Skill file</a>
+  <a href="https://github.com/blessed-649/PAC" target="_blank" rel="noopener">GitHub repository</a>
+  <span>PAC on NEAR testnet. Paper only here. Nothing here is real money.</span>
+</footer>
+<div id="status" class="hidden"></div>
+<script>
+// PAC paper trade simulator. Site side only. No wallet, no onchain writes.
+// The curve math below is an exact replay of the arena contract pure
+// helpers (price_per_token_yocto, buy_tokens_for_near, sell_proceeds_yocto,
+// fee_yocto), using BigInt throughout. The simulated sold count starts at
+// the live sold count and moves only with paper trades.
+const ARENA_ID = 'pac-arena.testnet';
+const RPC_URLS = ['https://rpc.testnet.fastnear.com', 'https://rpc.testnet.near.org'];
+const NEAR = 10n ** 24n;
+const CURVE_CHUNK = 1000000n;
+const CURVE_BASE = 1000000000000000000n; // 1e18 yocto per whole token
+const CURVE_STEP = 1000000000000000000n; // 1e18 yocto per chunk
+const FEE_BP = 100n; // 1%
+const FEED_LIMIT = 500; // get_activity returns at most this many events
+const STORE_PREFIX = 'pac-sim-';
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function status(msg, ms = 6000) {
+  const el = $('status');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  if (ms) setTimeout(() => el.classList.add('hidden'), ms);
+}
+function fmtNear(yoctoStr) {
+  try {
+    const v = BigInt(yoctoStr);
+    const neg = v < 0n;
+    const a = neg ? -v : v;
+    const whole = a / NEAR;
+    const frac = a % NEAR;
+    const fracStr = frac.toString().padStart(24, '0').slice(0, 6).replace(/0+$/, '') || '0';
+    return (neg ? '-' : '') + whole.toString() + '.' + fracStr;
+  } catch { return String(yoctoStr); }
+}
+function fmtInt(str) {
+  try { return BigInt(str).toLocaleString('en-US'); } catch { return String(str); }
+}
+function fmtTimeMs(ms) {
+  return new Date(ms).toLocaleString();
+}
+function fmtDateShort(ms) {
+  return new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+function parseNearFloat(s) {
+  const [w, f = ''] = String(s).trim().split('.');
+  return BigInt(w || '0') * NEAR + BigInt((f + '0'.repeat(24)).slice(0, 24) || '0');
+}
+
+// ---------- curve math (exact replay of the contract) ----------
+function pricePerTokenYocto(sold) {
+  return CURVE_BASE + CURVE_STEP * (sold / CURVE_CHUNK);
+}
+function buyTokensForNear(fromSold, nearYocto, maxTokens) {
+  let tokens = 0n, spent = 0n, sold = fromSold, remaining = nearYocto;
+  while (tokens < maxTokens) {
+    const chunkIdx = sold / CURVE_CHUNK;
+    const chunkEnd = (chunkIdx + 1n) * CURVE_CHUNK;
+    const price = CURVE_BASE + CURVE_STEP * chunkIdx;
+    const affordable = remaining / price;
+    if (affordable === 0n) break;
+    let take = affordable;
+    if (chunkEnd - sold < take) take = chunkEnd - sold;
+    if (maxTokens - tokens < take) take = maxTokens - tokens;
+    if (take === 0n) break;
+    const cost = take * price;
+    tokens += take; spent += cost; remaining -= cost; sold += take;
+  }
+  return { tokens, spent };
+}
+function sellProceedsYocto(fromSold, tokens) {
+  let proceeds = 0n, remaining = tokens, sold = fromSold;
+  while (remaining > 0n && sold > 0n) {
+    const chunkIdx = (sold - 1n) / CURVE_CHUNK;
+    const chunkStart = chunkIdx * CURVE_CHUNK;
+    const price = CURVE_BASE + CURVE_STEP * chunkIdx;
+    const room = sold - chunkStart;
+    const take = remaining < room ? remaining : room;
+    proceeds += take * price;
+    remaining -= take; sold -= take;
+  }
+  return proceeds;
+}
+function feeYocto(amount) { return amount * FEE_BP / 10000n; }
+
+// ---------- RPC reads ----------
+async function rpcView(contractId, method, args) {
+  const argsB64 = btoa(JSON.stringify(args));
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 'pac-sim', method: 'query', params: { request_type: 'call_function', account_id: contractId, method_name: method, args_base64: argsB64, finality: 'final' } });
+  let lastErr = null;
+  for (const url of RPC_URLS) {
+    try {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+      const j = await res.json();
+      if (j.error) throw new Error(method + ': ' + JSON.stringify(j.error).slice(0, 200));
+      const text = new TextDecoder().decode(new Uint8Array(j.result.result));
+      return JSON.parse(text);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('RPC failed');
+}
+const view = (method, args = {}) => rpcView(ARENA_ID, method, args);
+
+// ---------- price history reconstruction ----------
+// The feed returns newest first, at most FEED_LIMIT events across all
+// coins. Walk it backward from the live sold count: a buy or launch adds
+// its tokens to sold, a sell or copy sell removes them. Copy trades move
+// the curve too, so copy_buy and copy_sell count here.
+const SOLD_UP = { launch: 1n, buy: 1n, copy_buy: 1n, sell: -1n, copy_sell: -1n };
+function reconstructHistory(coinId, liveSold, activity) {
+  const events = activity.filter((e) => e.coin_id === coinId && SOLD_UP[e.kind] !== undefined);
+  let sold = liveSold;
+  const points = [];
+  for (const e of events) {
+    const tokens = BigInt(e.tokens || '0');
+    points.push({ t: Number(BigInt(e.timestamp_ns) / 1000000n), soldAfter: sold, price: pricePerTokenYocto(sold) });
+    sold = sold - SOLD_UP[e.kind] * tokens;
+  }
+  points.reverse(); // chronological
+  return { points, eventsSeen: events.length, soldBeforeOldest: sold, truncated: sold > 0n };
+}
+
+// ---------- paper portfolio (localStorage, per coin) ----------
+function loadPortfolio(coinId) {
+  try {
+    const raw = localStorage.getItem(STORE_PREFIX + coinId);
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    if (!p || typeof p.startNearYocto !== 'string') return null;
+    p.trades = Array.isArray(p.trades) ? p.trades : [];
+    return p;
+  } catch { return null; }
+}
+function savePortfolio(coinId, p) {
+  try { localStorage.setItem(STORE_PREFIX + coinId, JSON.stringify(p)); } catch { /* storage unavailable */ }
+}
+function newPortfolio(startNearYocto) {
+  return { startNearYocto: startNearYocto.toString(), nearYocto: startNearYocto.toString(), tokens: '0', costBasisYocto: '0', realisedYocto: '0', trades: [] };
+}
+
+// ---------- page state ----------
+let coinsCache = [];
+let coinId = 0;
+let liveCoin = null;
+let history = { points: [], eventsSeen: 0, soldBeforeOldest: 0n, truncated: false };
+let feedTotal = 0;
+let portfolio = null;
+
+function simSold() {
+  if (!liveCoin) return 0n;
+  return BigInt(liveCoin.sold_tokens) + BigInt(portfolio ? portfolio.tokens : '0');
+}
+function simPrice() { return pricePerTokenYocto(simSold()); }
+function livePrice() { return liveCoin ? pricePerTokenYocto(BigInt(liveCoin.sold_tokens)) : 0n; }
+function holdingsValueYocto() {
+  if (!portfolio) return 0n;
+  return BigInt(portfolio.tokens) * simPrice();
+}
+function portfolioValueYocto() {
+  if (!portfolio) return 0n;
+  return BigInt(portfolio.nearYocto) + holdingsValueYocto();
+}
+function unrealisedYocto() {
+  if (!portfolio) return 0n;
+  return holdingsValueYocto() - BigInt(portfolio.costBasisYocto);
+}
+function totalPnlYocto() {
+  if (!portfolio) return 0n;
+  return BigInt(portfolio.realisedYocto) + unrealisedYocto();
+}
+
+// ---------- charts ----------
+// Simple SVG line charts. Values arrive as BigInt yocto; valueFn maps a
+// point to a display Number. The charts are pictures of the past only.
+function lineChart(points, valueFn, unitLabel) {
+  if (!points.length) return '<p class="muted">No points to chart yet.</p>';
+  const W = 640, H = 220, PL = 8, PR = 8, PT = 14, PB = 22;
+  const vals = points.map((p) => valueFn(p));
+  let min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+  if (min === max) { min = min * 0.9; max = max * 1.1; if (min === max) { min = 0; max = 1; } }
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+  const x = (t) => PL + ((t - t0) / span) * (W - PL - PR);
+  const y = (v) => PT + (1 - (v - min) / (max - min)) * (H - PT - PB);
+  const d = points.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.t).toFixed(1) + ' ' + y(valueFn(p)).toFixed(1)).join(' ');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(unitLabel)} chart">
+    <path d="${d}" fill="none" stroke="#d29922" stroke-width="2" />
+    <circle cx="${x(points[points.length - 1].t).toFixed(1)}" cy="${y(vals[vals.length - 1]).toFixed(1)}" r="4" fill="#d29922" />
+    <text x="${PL}" y="${PT - 2}" fill="#8b949e" font-size="11">high ${max.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${esc(unitLabel)}</text>
+    <text x="${PL}" y="${H - 6}" fill="#8b949e" font-size="11">low ${min.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${esc(unitLabel)}</text>
+    <text x="${W - PR}" y="${H - 6}" fill="#8b949e" font-size="11" text-anchor="end">${esc(fmtDateShort(t0))} to ${esc(fmtDateShort(t1))}</text>
+  </svg>`;
+}
+function yoctoToNearFloat(yoctoBig) {
+  return Number(yoctoBig) / 1e24;
+}
+
+// ---------- portfolio value over time ----------
+// Value at each history point: paper NEAR plus paper tokens valued at the
+// simulated curve price at that time. The simulated sold at a past time
+// is the real sold then (from the reconstructed history) plus the paper
+// tokens held then. Before the first paper trade the value is flat at
+// the starting balance.
+function portfolioValueSeries() {
+  if (!liveCoin || !portfolio) return [];
+  const trades = portfolio.trades.slice().sort((a, b) => a.t - b.t);
+  let near = BigInt(portfolio.startNearYocto);
+  let tokens = 0n;
+  let ti = 0;
+  const pts = [];
+  for (const p of history.points) {
+    while (ti < trades.length && trades[ti].t <= p.t) {
+      const tr = trades[ti];
+      if (tr.kind === 'buy') { near -= BigInt(tr.spentYocto); tokens += BigInt(tr.tokens); }
+      else { near += BigInt(tr.netYocto); tokens -= BigInt(tr.tokens); }
+      ti++;
+    }
+    const simSoldAt = p.soldAfter + tokens;
+    const price = pricePerTokenYocto(simSoldAt);
+    pts.push({ t: p.t, value: near + tokens * price });
+  }
+  while (ti < trades.length) {
+    const tr = trades[ti];
+    if (tr.kind === 'buy') { near -= BigInt(tr.spentYocto); tokens += BigInt(tr.tokens); }
+    else { near += BigInt(tr.netYocto); tokens -= BigInt(tr.tokens); }
+    ti++;
+  }
+  pts.push({ t: Date.now(), value: near + tokens * simPrice() });
+  return pts;
+}
+
+// ---------- rendering ----------
+function renderPortfolio() {
+  const box = $('portfolioBox');
+  if (!liveCoin || !portfolio) { box.innerHTML = '<p class="muted">Loading portfolio…</p>'; return; }
+  const un = unrealisedYocto();
+  const tot = totalPnlYocto();
+  const pnlClass = (v) => v > 0n ? 'pos' : (v < 0n ? 'neg' : '');
+  const pnlText = (v) => (v > 0n ? '+' : '') + fmtNear(v.toString()) + ' NEAR';
+  box.innerHTML = `
+    <span>Starting paper balance</span><b>${fmtNear(portfolio.startNearYocto)} NEAR (simulated)</b>
+    <span>Paper NEAR left</span><b>${fmtNear(portfolio.nearYocto)} NEAR (simulated)</b>
+    <span>Paper tokens held</span><b>${fmtInt(portfolio.tokens)} tokens (simulated)</b>
+    <span>Cost basis</span><b>${fmtNear(portfolio.costBasisYocto)} NEAR (simulated)</b>
+    <span>Live curve price</span><b>${fmtNear(livePrice().toString())} NEAR / token</b>
+    <span>Simulated price</span><b>${fmtNear(simPrice().toString())} NEAR / token</b>
+    <span>Simulated sold</span><b>${fmtInt(simSold().toString())} / ${fmtInt(liveCoin.curve_cap_tokens)} tokens</b>
+    <span>Current value (simulated)</span><b>${fmtNear(portfolioValueYocto().toString())} NEAR</b>
+    <span>Realised PnL (simulated)</span><b class="${pnlClass(BigInt(portfolio.realisedYocto))}">${pnlText(BigInt(portfolio.realisedYocto))}</b>
+    <span>Unrealised PnL (simulated)</span><b class="${pnlClass(un)}">${pnlText(un)}</b>
+    <span>Total PnL (simulated)</span><b class="${pnlClass(tot)}">${pnlText(tot)}</b>`;
+}
+function renderTradeLog() {
+  const box = $('tradeLog');
+  if (!portfolio || !portfolio.trades.length) { box.innerHTML = '<p class="muted">No paper trades yet.</p>'; return; }
+  const rows = portfolio.trades.slice().reverse().map((tr) => {
+    if (tr.kind === 'buy') {
+      return `<tr><td>${fmtTimeMs(tr.t)}</td><td>Paper buy</td><td>${fmtInt(tr.tokens)} tokens</td><td>spent ${fmtNear(tr.spentYocto)} NEAR</td><td>fee 0 (fee comes off the reserve, not your tokens)</td><td class="muted">—</td></tr>`;
+    }
+    return `<tr><td>${fmtTimeMs(tr.t)}</td><td>Paper sell</td><td>${fmtInt(tr.tokens)} tokens</td><td>received ${fmtNear(tr.netYocto)} NEAR</td><td>fee ${fmtNear(tr.feeYocto)} NEAR</td><td class="${BigInt(tr.realisedYocto) >= 0n ? 'pos' : 'neg'}">${BigInt(tr.realisedYocto) >= 0n ? '+' : ''}${fmtNear(tr.realisedYocto)} NEAR</td></tr>`;
+  }).join('');
+  box.innerHTML = `<table><thead><tr><th>Time</th><th>Trade</th><th>Amount</th><th>NEAR</th><th>Fee (simulated)</th><th>Realised PnL (simulated)</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderCharts() {
+  const priceEl = $('priceChart');
+  const noteEl = $('priceChartNote');
+  if (!history.points.length) {
+    priceEl.innerHTML = '<p class="muted">No real trades in the feed yet for this coin, so there is no price history to show. The simulated price starts at the live curve price above.</p>';
+    noteEl.textContent = '';
+  } else {
+    priceEl.innerHTML = lineChart(history.points, (p) => yoctoToNearFloat(p.price), 'NEAR / token');
+    noteEl.innerHTML = `<span>${history.points.length} price points (simulated view of real trades)</span><span>now ${fmtNear(livePrice().toString())} NEAR / token</span>`;
+  }
+  $('historyNote').textContent = history.truncated
+    ? `History is truncated: the feed holds at most ${FEED_LIMIT} events across all coins, and older trades for this coin sit beyond that window. The chart starts at the oldest trade the feed still holds.`
+    : `History covers ${history.eventsSeen} trade event(s) for this coin from the feed (at most ${FEED_LIMIT} events across all coins). The price at each point is the curve price right after that trade.`;
+  const valueEl = $('valueChart');
+  const valuePts = portfolioValueSeries();
+  if (!valuePts.length) {
+    valueEl.innerHTML = '<p class="muted">No portfolio value to chart yet.</p>';
+    $('valueChartNote').textContent = '';
+  } else {
+    valueEl.innerHTML = lineChart(valuePts, (p) => yoctoToNearFloat(p.value), 'NEAR');
+    $('valueChartNote').innerHTML = `<span>starting ${fmtNear(portfolio.startNearYocto)} NEAR (simulated)</span><span>now ${fmtNear(portfolioValueYocto().toString())} NEAR (simulated)</span>`;
+  }
+}
+function renderCoinInfo() {
+  const el = $('coinInfo');
+  if (!liveCoin) { el.textContent = 'Loading coin…'; return; }
+  el.textContent = `${liveCoin.name} $${liveCoin.symbol} · live price ${fmtNear(livePrice().toString())} NEAR per token · ${fmtInt(liveCoin.sold_tokens)} of ${fmtInt(liveCoin.curve_cap_tokens)} tokens sold on the curve · ${liveCoin.holders} holders. Your paper trades start from this live sold count and never touch it.`;
+}
+function renderAll() {
+  renderCoinInfo();
+  renderPortfolio();
+  renderTradeLog();
+  renderCharts();
+  updatePreview();
+}
+
+// ---------- trade previews ----------
+function updatePreview() {
+  const el = $('tradePreview');
+  if (!liveCoin || !portfolio) { el.textContent = 'Enter an amount to see the simulated quote.'; return; }
+  const buyRaw = $('buyNear').value;
+  const sellRaw = $('sellTokens').value;
+  const parts = [];
+  if (buyRaw && Number(buyRaw) > 0) {
+    const nearYocto = parseNearFloat(buyRaw);
+    const maxTokens = BigInt(liveCoin.curve_cap_tokens) - simSold();
+    if (maxTokens <= 0n) {
+      parts.push('Paper buy: the simulated curve is sold out at the live cap.');
+    } else {
+      const q = buyTokensForNear(simSold(), nearYocto, maxTokens);
+      if (q.tokens === 0n) parts.push('Paper buy: that amount buys zero tokens at the simulated price.');
+      else parts.push(`Paper buy (simulated): ${fmtNear(buyRaw)} NEAR buys about ${fmtInt(q.tokens.toString())} tokens for ${fmtNear(q.spent.toString())} NEAR, simulated price after ${fmtNear(pricePerTokenYocto(simSold() + q.tokens).toString())} NEAR per token.`);
+    }
+  }
+  if (sellRaw && Number(sellRaw) > 0) {
+    const tokens = BigInt(Math.floor(Number(sellRaw)));
+    const held = BigInt(portfolio.tokens);
+    if (tokens > held) {
+      parts.push(`Paper sell: you hold ${fmtInt(portfolio.tokens)} paper tokens, less than ${fmtInt(tokens.toString())}.`);
+    } else {
+      const gross = sellProceedsYocto(simSold(), tokens);
+      const fee = feeYocto(gross);
+      parts.push(`Paper sell (simulated): ${fmtInt(tokens.toString())} tokens return ${fmtNear((gross - fee).toString())} NEAR after the 1% fee of ${fmtNear(fee.toString())} NEAR.`);
+    }
+  }
+  el.textContent = parts.length ? parts.join(' ') : 'Enter an amount to see the simulated quote. A paper buy spends paper NEAR for tokens at the simulated curve price. A paper sell returns 99% of the curve proceeds, after the 1% trading fee, exactly as the real arena does.';
+}
+
+// ---------- paper trades ----------
+function paperBuy() {
+  if (!liveCoin || !portfolio) return;
+  const raw = $('buyNear').value;
+  if (!raw || Number(raw) <= 0) { status('Enter paper NEAR to spend (more than 0).'); return; }
+  const nearYocto = parseNearFloat(raw);
+  if (nearYocto > BigInt(portfolio.nearYocto)) { status('Not enough paper NEAR. Your simulated balance is ' + fmtNear(portfolio.nearYocto) + ' NEAR.'); return; }
+  const maxTokens = BigInt(liveCoin.curve_cap_tokens) - simSold();
+  if (maxTokens <= 0n) { status('The simulated curve is sold out at the live cap.'); return; }
+  const q = buyTokensForNear(simSold(), nearYocto, maxTokens);
+  if (q.tokens === 0n) { status('That amount buys zero tokens at the simulated price.'); return; }
+  portfolio.nearYocto = (BigInt(portfolio.nearYocto) - q.spent).toString();
+  portfolio.tokens = (BigInt(portfolio.tokens) + q.tokens).toString();
+  portfolio.costBasisYocto = (BigInt(portfolio.costBasisYocto) + q.spent).toString();
+  portfolio.trades.push({ t: Date.now(), kind: 'buy', tokens: q.tokens.toString(), spentYocto: q.spent.toString(), priceYocto: simPrice().toString() });
+  savePortfolio(coinId, portfolio);
+  renderAll();
+  status(`Paper buy (simulated): ${fmtInt(q.tokens.toString())} tokens for ${fmtNear(q.spent.toString())} NEAR.`, 6000);
+}
+function paperSell() {
+  if (!liveCoin || !portfolio) return;
+  const raw = $('sellTokens').value;
+  if (!raw || Number(raw) <= 0) { status('Enter whole paper tokens to sell.'); return; }
+  const tokens = BigInt(Math.floor(Number(raw)));
+  const held = BigInt(portfolio.tokens);
+  if (tokens > held) { status(`You hold ${fmtInt(portfolio.tokens)} paper tokens.`); return; }
+  const gross = sellProceedsYocto(simSold(), tokens);
+  const fee = feeYocto(gross);
+  const net = gross - fee;
+  const avgCost = held > 0n ? BigInt(portfolio.costBasisYocto) / held : 0n;
+  const costOfSold = tokens * avgCost;
+  const realised = net - costOfSold;
+  portfolio.nearYocto = (BigInt(portfolio.nearYocto) + net).toString();
+  portfolio.tokens = (held - tokens).toString();
+  portfolio.costBasisYocto = (BigInt(portfolio.costBasisYocto) - costOfSold).toString();
+  portfolio.realisedYocto = (BigInt(portfolio.realisedYocto) + realised).toString();
+  portfolio.trades.push({ t: Date.now(), kind: 'sell', tokens: tokens.toString(), grossYocto: gross.toString(), feeYocto: fee.toString(), netYocto: net.toString(), realisedYocto: realised.toString() });
+  savePortfolio(coinId, portfolio);
+  renderAll();
+  status(`Paper sell (simulated): ${fmtInt(tokens.toString())} tokens for ${fmtNear(net.toString())} NEAR after the fee. Realised PnL ${realised >= 0n ? '+' : ''}${fmtNear(realised.toString())} NEAR (simulated).`, 8000);
+}
+
+// ---------- load and setup ----------
+async function loadCoinData() {
+  liveCoin = await view('get_coin', { coin_id: coinId });
+  const activity = await view('get_activity', { limit: FEED_LIMIT });
+  feedTotal = activity.length;
+  history = reconstructHistory(coinId, BigInt(liveCoin.sold_tokens), activity);
+}
+function startFresh() {
+  const start = parseNearFloat($('startBalance').value || '10');
+  portfolio = newPortfolio(start);
+  savePortfolio(coinId, portfolio);
+  renderAll();
+  status('Fresh paper portfolio started with ' + fmtNear(start.toString()) + ' NEAR (simulated).', 6000);
+}
+async function refreshLive() {
+  try {
+    await loadCoinData();
+    renderAll();
+    status('Live data refreshed.');
+  } catch (e) {
+    console.warn('refresh failed', e);
+    status('Live data refresh failed: ' + String(e.message).slice(0, 120), 8000);
+  }
+}
+function onCoinChange() {
+  coinId = parseInt($('coinSelect').value, 10);
+  history = { points: [], eventsSeen: 0, soldBeforeOldest: 0n, truncated: false };
+  liveCoin = null;
+  portfolio = loadPortfolio(coinId);
+  initCoin();
+}
+async function initCoin() {
+  try {
+    if (!portfolio) {
+      portfolio = newPortfolio(parseNearFloat($('startBalance').value || '10'));
+      savePortfolio(coinId, portfolio);
+    }
+    await loadCoinData();
+    renderAll();
+  } catch (e) {
+    console.error(e);
+    $('coinInfo').textContent = 'Failed to load live data: ' + String(e.message).slice(0, 200);
+  }
+}
+async function init() {
+  const params = new URLSearchParams(window.location.search);
+  const qCoin = parseInt(params.get('coin') || '0', 10);
+  coinId = Number.isNaN(qCoin) ? 0 : qCoin;
+  try {
+    coinsCache = await view('list_coins', { from_index: 0, limit: 50 });
+  } catch (e) {
+    console.error(e);
+    $('coinSelect').innerHTML = '<option value="0">Coin 0</option>';
+    $('coinInfo').textContent = 'Failed to load the coin list: ' + String(e.message).slice(0, 200);
+    return;
+  }
+  if (!coinsCache.length) {
+    $('coinSelect').innerHTML = '<option value="0">No coins yet</option>';
+    $('coinInfo').textContent = 'No coins exist yet. Launch one from the home page first, then come back here to paper trade it.';
+    return;
+  }
+  if (!coinsCache.some((c) => c.id === coinId)) coinId = coinsCache[0].id;
+  $('coinSelect').innerHTML = coinsCache.map((c) => `<option value="${c.id}" ${c.id === coinId ? 'selected' : ''}>${esc(c.name)} $${esc(c.symbol)} (coin ${c.id})</option>`).join('');
+  portfolio = loadPortfolio(coinId);
+  $('buyNear').addEventListener('input', updatePreview);
+  $('sellTokens').addEventListener('input', updatePreview);
+  await initCoin();
+}
+
+// Exposed for tests: the pure curve math and the history reconstruction.
+window.__sim = {
+  pricePerTokenYocto, buyTokensForNear, sellProceedsYocto, feeYocto,
+  reconstructHistory, newPortfolio,
+  state: () => ({ coinId, liveCoin, history, portfolio, feedTotal }),
+};
+init();
+</script>
+</body>
+</html>
