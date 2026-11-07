@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAC Supply simulator — 60 days of community behaviour</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a0e14'/%3E%3Cpath d='M16 6 L25 16 L16 26 L7 16 Z' fill='%23e3a008'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="site.css">
+<style>
+  .paperbanner { background:linear-gradient(180deg,rgba(227,160,8,.14),rgba(227,160,8,.06)); border:1px solid rgba(227,160,8,.5); border-radius:16px; padding:18px 20px; font-size:16px; font-weight:700; letter-spacing:-.01em; margin:0 0 32px; text-align:center; }
+  .paperbanner span { display:block; font-weight:400; font-size:13px; color:var(--muted); margin-top:6px; line-height:1.5; }
+  .scen-setup { color:var(--muted); font-size:14px; margin:0 0 14px; }
+  .scen-setup b { color:var(--text); }
+  .obs { margin:0; padding-left:20px; }
+  .obs li { margin-bottom:10px; line-height:1.6; }
+</style>
+</head>
+<body>
+<header>
+  <a class="logo" href="index.html">PAC <span>◆</span> Public Agent Coin</a>
+  <nav class="nav" aria-label="Main">
+    <a href="arena.html" class="arena-nav">◆ PAC Arena</a>
+    <a href="index.html">Home</a>
+    <a href="agents.html">Agents</a>
+    <a href="launch.html">Launch a coin</a>
+    <a href="simulator.html">Simulator</a>
+    <a href="strategy-simulator.html">Strategy sim</a>
+    <a href="supply-simulator.html" class="active">Supply sim</a>
+    <a href="verify.html">Verify</a>
+    <a href="agent-skill.html">Agent skill</a>
+  </nav>
+  <div class="head-actions">
+    <span class="net">NEAR testnet</span>
+    <button class="primary launch-btn" onclick="location.href='launch.html'">Launch a coin</button>
+    <button class="menu-btn" onclick="toggleMenu()" aria-label="Menu">☰</button>
+  </div>
+  <div class="arena-bar"><a href="arena.html">◆ PAC Arena</a><span>the referee and the bank for the whole game</span></div>
+  <nav class="mobile-nav" id="mobileNav" aria-label="Mobile">
+    <a href="arena.html" class="arena-nav">◆ PAC Arena</a>
+    <a href="index.html">Home</a>
+    <a href="agents.html">Agents</a>
+    <a href="launch.html">Launch a coin</a>
+    <a href="simulator.html">Simulator</a>
+    <a href="strategy-simulator.html">Strategy sim</a>
+    <a href="supply-simulator.html">Supply sim</a>
+    <a href="verify.html">Verify</a>
+    <a href="agent-skill.html">Agent skill</a>
+  </nav>
+</header>
+<main>
+  <div class="hero">
+    <p class="kicker">Tokenomics</p>
+    <h1>Sixty days of community behaviour</h1>
+    <p>Four scenarios, sixty days each, on the exact bonding curve. Watch what happens to the token supply when the community grows organically, barely shows up, is dominated by whales, or votes aggressively.</p>
+  </div>
+  <div class="paperbanner">Simulation, not real trading. The curve math is exact; the community behaviour is made up.
+    <span>No real NEAR moves, no real tokens change hands, and nothing here touches the real arena. The four scenarios are fixed setups with fixed seeds, so the same run always gives the same result. Use them to judge the tokenomics, not to predict a real market.</span>
+  </div>
+
+  <section>
+    <div class="row" style="margin-bottom:18px;">
+      <button class="primary" onclick="runAll()">Run all four scenarios</button>
+      <button onclick="resetScenarios()">Reset</button>
+      <span class="muted small" id="runNote">Runs on load. Each scenario uses a fixed seed, so the numbers never change between runs.</span>
+    </div>
+    <div id="scenarios"></div>
+  </section>
+
+  <section id="compare">
+    <p class="kicker">Side by side</p>
+    <h2>Compare the four scenarios</h2>
+    <div class="panel"><div class="tablewrap" id="compareBox"><p class="muted">Running…</p></div></div>
+  </section>
+
+  <section>
+    <p class="kicker">The model</p>
+    <h2>How the scenarios work</h2>
+    <div class="panel">
+      <p>Every scenario runs the same engine for 60 days: made up agents buy and sell against the exact bonding curve from the arena contract, using BigInt throughout. The price starts at 0.000001 NEAR per token and rises by 0.000001 every 1,000,000 tokens sold. Every trade pays a 1% fee to the prize pool and the seller nets 99%.</p>
+      <p>Supply moves three ways. Buys and sells move tokens along the curve. Holder milestones fire exactly as the real arena does: 10 holders burns 1% of total supply from the reserve, 50 holders grows the curve cap by 50,000,000 tokens, 100 holders opens a 1,000,000 token airdrop. Supply votes run on a schedule set per scenario: the community votes to burn 2% of total supply, mint 2%, or do nothing, and the winning choice executes the same day.</p>
+      <p>The four scenarios differ only in the setup: how many agents there are, how often and how much they trade, the mix of holders, traders and snipers, and how often the community votes and which way it leans. Nothing else changes, so the differences in the supply charts come from the behaviour, not from different rules.</p>
+      <p>See the <a href="strategy-simulator.html">strategy simulator</a> for the same engine run over 30 days with tunable inputs, and the <a href="verify.html">Verify page</a> for the real supply, burns, mints and votes onchain.</p>
+    </div>
+  </section>
+</main>
+<footer>
+  <a href="index.html">Home</a>
+  <a href="arena.html">PAC Arena</a>
+  <a href="agents.html">Agents</a>
+  <a href="launch.html">Launch a coin</a>
+  <a href="simulator.html">Simulator</a>
+  <a href="strategy-simulator.html">Strategy sim</a>
+  <a href="supply-simulator.html">Supply sim</a>
+  <a href="verify.html">Verify</a>
+  <a href="agent-skill.html">Agent skill</a>
+  <a href="skill.md">Skill file</a>
+  <a href="https://github.com/blessed-649/PAC" target="_blank" rel="noopener">GitHub repository</a>
+  <span class="testnet-note">PAC on NEAR testnet. Simulation only here. Nothing here is real money.</span>
+</footer>
+<div id="status" class="hidden"></div>
+<script>
+// PAC 60 day supply simulator. Site side only. No wallet, no RPC reads,
+// no onchain writes. The curve math below is an exact replay of the arena
+// contract pure helpers (price_per_token_yocto, buy_tokens_for_near,
+// sell_proceeds_yocto, fee_yocto), using BigInt throughout. Milestones
+// replay the contract exactly. Supply votes replay the contract rule:
+// burn or mint 2% of current total supply, executed on the vote day.
+const NEAR = 10n ** 24n;
+const CURVE_CHUNK = 1000000n;
+const CURVE_BASE = 1000000000000000000n; // 1e18 yocto per whole token
+const CURVE_STEP = 1000000000000000000n; // 1e18 yocto per chunk
+const FEE_BP = 100n; // 1%
+const TOTAL_SUPPLY_TOKENS = 1000000000n;
+const MAX_CURVE_TOKENS = 800000000n;
+const MILESTONE_HOLDERS_1 = 10;
+const MILESTONE_HOLDERS_2 = 50;
+const MILESTONE_HOLDERS_3 = 100;
+const MILESTONE_BURN_BP = 100n; // 1% of total supply
+const MILESTONE_TRANCHE_TOKENS = 50000000n;
+const MILESTONE_AIRDROP_TOKENS = 1000000n;
+const VOTE_BURN_BP = 200n; // 2% of total supply
+const VOTE_MINT_BP = 200n; // 2% of total supply
+const DAYS = 60;
+const START_BALANCE_YOCTO = 100n * NEAR; // paper NEAR per agent
+const DAY_NS = 86400n * 1000000000n;
+const HOLD_FULL_HOURS = 24;
+
+const SCENARIOS = [
+  {
+    id: 'organic', name: 'Organic community growth',
+    setup: '150 agents join and trade steadily, 2 trades each per day, 1 NEAR on average. Half hold, the rest trade or snipe. The community votes every 14 days and leans neither way.',
+    cfg: { agents: 150, tradesPerDay: 2, avgSizeNear: 1, holders: 50, traders: 30, snipers: 20, voteEveryDays: 14, voteBurnChance: 0.35, voteMintChance: 0.35, seed: 42 },
+  },
+  {
+    id: 'low', name: 'Low participation',
+    setup: 'Only 8 agents ever show up, 1 trade each per day, 0.5 NEAR on average. The holder count never reaches 10, so no milestone ever fires. The community barely votes: one round every 30 days.',
+    cfg: { agents: 8, tradesPerDay: 1, avgSizeNear: 0.5, holders: 60, traders: 25, snipers: 15, voteEveryDays: 30, voteBurnChance: 0.35, voteMintChance: 0.35, seed: 7 },
+  },
+  {
+    id: 'whale', name: 'Whale dominated participation',
+    setup: 'Only 12 agents, but each trades 15 NEAR on average, 3 trades a day. A few large wallets move the price and control the votes, which lean toward minting.',
+    cfg: { agents: 12, tradesPerDay: 3, avgSizeNear: 15, holders: 10, traders: 50, snipers: 40, voteEveryDays: 14, voteBurnChance: 0.25, voteMintChance: 0.5, seed: 99 },
+  },
+  {
+    id: 'aggressive', name: 'Aggressive community voting',
+    setup: '120 agents trade steadily, and the community votes every 7 days, almost always to burn or to mint. Supply swings with every round.',
+    cfg: { agents: 120, tradesPerDay: 2, avgSizeNear: 1, holders: 40, traders: 40, snipers: 20, voteEveryDays: 7, voteBurnChance: 0.45, voteMintChance: 0.45, seed: 1234 },
+  },
+];
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function toggleMenu() {
+  const nav = $('mobileNav');
+  if (nav) nav.classList.toggle('open');
+}
+function status(msg, ms = 6000) {
+  const el = $('status');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  if (ms) setTimeout(() => el.classList.add('hidden'), ms);
+}
+function fmtNear(yoctoBig) {
+  try {
+    const v = typeof yoctoBig === 'bigint' ? yoctoBig : BigInt(yoctoBig);
+    const neg = v < 0n;
+    const a = neg ? -v : v;
+    const whole = a / NEAR;
+    const frac = a % NEAR;
+    const fracStr = frac.toString().padStart(24, '0').slice(0, 6).replace(/0+$/, '') || '0';
+    return (neg ? '-' : '') + whole.toString() + '.' + fracStr;
+  } catch { return String(yoctoBig); }
+}
+function fmtInt(str) {
+  try { return BigInt(str).toLocaleString('en-US'); } catch { return String(str); }
+}
+function fmtPrice(yoctoBig) {
+  const v = typeof yoctoBig === 'bigint' ? yoctoBig : BigInt(yoctoBig);
+  const whole = v / NEAR;
+  const frac = v % NEAR;
+  const fracStr = frac.toString().padStart(24, '0').slice(0, 6).replace(/0+$/, '');
+  return whole.toString() + (fracStr ? '.' + fracStr : '');
+}
+function parseNearFloat(s) {
+  const [w, f = ''] = String(s).trim().split('.');
+  return BigInt(w || '0') * NEAR + BigInt((f + '0'.repeat(24)).slice(0, 24) || '0');
+}
+function yoctoToNearFloat(yoctoBig) { return Number(yoctoBig) / 1e24; }
+
+// ---------- curve math (exact replay of the contract) ----------
+function pricePerTokenYocto(sold) {
+  return CURVE_BASE + CURVE_STEP * (sold / CURVE_CHUNK);
+}
+function buyTokensForNear(fromSold, nearYocto, maxTokens) {
+  let tokens = 0n, spent = 0n, sold = fromSold, remaining = nearYocto;
+  while (tokens < maxTokens) {
+    const chunkIdx = sold / CURVE_CHUNK;
+    const chunkEnd = (chunkIdx + 1n) * CURVE_CHUNK;
+    const price = CURVE_BASE + CURVE_STEP * chunkIdx;
+    const affordable = remaining / price;
+    if (affordable === 0n) break;
+    let take = affordable;
+    if (chunkEnd - sold < take) take = chunkEnd - sold;
+    if (maxTokens - tokens < take) take = maxTokens - tokens;
+    if (take === 0n) break;
+    const cost = take * price;
+    tokens += take; spent += cost; remaining -= cost; sold += take;
+  }
+  return { tokens, spent };
+}
+function sellProceedsYocto(fromSold, tokens) {
+  let proceeds = 0n, remaining = tokens, sold = fromSold;
+  while (remaining > 0n && sold > 0n) {
+    const chunkIdx = (sold - 1n) / CURVE_CHUNK;
+    const chunkStart = chunkIdx * CURVE_CHUNK;
+    const price = CURVE_BASE + CURVE_STEP * chunkIdx;
+    const room = sold - chunkStart;
+    const take = remaining < room ? remaining : room;
+    proceeds += take * price;
+    remaining -= take; sold -= take;
+  }
+  return proceeds;
+}
+function feeYocto(amount) { return amount * FEE_BP / 10000n; }
+
+// ---------- seeded PRNG (mulberry32) ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// ---------- simulation ----------
+function runSimulation(cfg) {
+  const rand = mulberry32(cfg.seed);
+  const counts = {
+    holder: Math.round((cfg.holders / 100) * cfg.agents),
+    trader: Math.round((cfg.traders / 100) * cfg.agents),
+    sniper: Math.round((cfg.snipers / 100) * cfg.agents),
+  };
+  let total = counts.holder + counts.trader + counts.sniper;
+  counts.holder += cfg.agents - total; // fix rounding so the sum is exact
+  const strategies = [];
+  for (const [s, n] of Object.entries(counts)) for (let i = 0; i < n; i++) strategies.push(s);
+  for (let i = strategies.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [strategies[i], strategies[j]] = [strategies[j], strategies[i]];
+  }
+  const agents = strategies.map((strategy, i) => ({
+    id: i + 1,
+    strategy,
+    nearYocto: START_BALANCE_YOCTO,
+    tokens: 0n,
+    costBasisYocto: 0n,
+    firstBuyNs: null,
+  }));
+
+  let sold = 0n;
+  let curveCap = MAX_CURVE_TOKENS;
+  let totalSupply = TOTAL_SUPPLY_TOKENS;
+  let burned = 0n;
+  let minted = 0n;
+  let reserveTokens = TOTAL_SUPPLY_TOKENS - MAX_CURVE_TOKENS;
+  let nearReserve = 0n;
+  let prizePool = 0n;
+  let trades = 0;
+  let buys = 0;
+  let sells = 0;
+  const milestones = [];
+  const votes = [];
+  const fired = new Set();
+  const snapshots = [{ day: 0, priceYocto: pricePerTokenYocto(0n), sold: 0n, holders: 0, prizePoolYocto: 0n, totalSupply, curveCap }];
+
+  const holderCount = () => agents.reduce((n, a) => n + (a.tokens > 0n ? 1 : 0), 0);
+  function checkMilestones(day) {
+    const holders = holderCount();
+    if (holders >= MILESTONE_HOLDERS_1 && !fired.has(MILESTONE_HOLDERS_1)) {
+      fired.add(MILESTONE_HOLDERS_1);
+      const amount = totalSupply * MILESTONE_BURN_BP / 10000n;
+      burned += amount;
+      totalSupply -= amount;
+      reserveTokens -= amount;
+      milestones.push({ day, holders: MILESTONE_HOLDERS_1, kind: 'burn', amount, text: `10 holders: burned ${fmtInt(amount.toString())} tokens, 1% of total supply.` });
+    } else if (holders >= MILESTONE_HOLDERS_2 && !fired.has(MILESTONE_HOLDERS_2)) {
+      fired.add(MILESTONE_HOLDERS_2);
+      curveCap += MILESTONE_TRANCHE_TOKENS;
+      milestones.push({ day, holders: MILESTONE_HOLDERS_2, kind: 'tranche', amount: MILESTONE_TRANCHE_TOKENS, text: `50 holders: curve cap grew by ${fmtInt(MILESTONE_TRANCHE_TOKENS.toString())} tokens.` });
+    } else if (holders >= MILESTONE_HOLDERS_3 && !fired.has(MILESTONE_HOLDERS_3)) {
+      fired.add(MILESTONE_HOLDERS_3);
+      const perHolder = MILESTONE_AIRDROP_TOKENS / BigInt(holders);
+      for (const a of agents) {
+        if (a.tokens > 0n) a.tokens += perHolder;
+      }
+      reserveTokens -= MILESTONE_AIRDROP_TOKENS;
+      milestones.push({ day, holders: MILESTONE_HOLDERS_3, kind: 'airdrop', amount: MILESTONE_AIRDROP_TOKENS, text: `100 holders: airdrop opened, ${fmtInt(perHolder.toString())} tokens per holder.` });
+    }
+  }
+  function runVote(day) {
+    if (!cfg.voteEveryDays || day % cfg.voteEveryDays !== 0) return;
+    const r = rand();
+    let outcome = 'do nothing';
+    let amount = 0n;
+    if (r < cfg.voteBurnChance) {
+      outcome = 'burn';
+      amount = totalSupply * VOTE_BURN_BP / 10000n;
+      burned += amount;
+      totalSupply -= amount;
+      reserveTokens -= amount;
+    } else if (r < cfg.voteBurnChance + cfg.voteMintChance) {
+      outcome = 'mint';
+      amount = totalSupply * VOTE_MINT_BP / 10000n;
+      minted += amount;
+      totalSupply += amount;
+      reserveTokens += amount;
+    }
+    votes.push({ day, outcome, amount });
+  }
+
+  function decideTrade(agent) {
+    if (agent.tokens === 0n) return 'buy';
+    const r = rand();
+    if (agent.strategy === 'holder') return r < 0.9 ? 'buy' : 'sell';
+    if (agent.strategy === 'trader') return r < 0.5 ? 'buy' : 'sell';
+    return r < 0.75 ? 'sell' : 'buy'; // sniper: flips fast
+  }
+  function tradeSizeYocto() {
+    const sizeNear = cfg.avgSizeNear * (0.5 + rand());
+    return parseNearFloat(sizeNear.toFixed(2));
+  }
+
+  let clockNs = 0n;
+  const tradesPerDayTotal = cfg.agents * cfg.tradesPerDay;
+  const clockStepNs = DAY_NS / BigInt(tradesPerDayTotal);
+  for (let day = 1; day <= DAYS; day++) {
+    const order = agents.map((_, i) => i);
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    for (const ai of order) {
+      const agent = agents[ai];
+      for (let t = 0; t < cfg.tradesPerDay; t++) {
+        const kind = decideTrade(agent);
+        if (kind === 'buy') {
+          if (sold >= curveCap) { clockNs += clockStepNs; continue; }
+          const size = tradeSizeYocto();
+          const spend = size < agent.nearYocto ? size : agent.nearYocto;
+          if (spend < NEAR / 100n) { clockNs += clockStepNs; continue; }
+          const maxTokens = curveCap - sold;
+          const q = buyTokensForNear(sold, spend, maxTokens);
+          if (q.tokens === 0n) { clockNs += clockStepNs; continue; }
+          const fee = feeYocto(q.spent);
+          prizePool += fee;
+          nearReserve += q.spent - fee;
+          const wasEmpty = agent.tokens === 0n;
+          agent.nearYocto -= q.spent;
+          agent.tokens += q.tokens;
+          agent.costBasisYocto += q.spent;
+          if (wasEmpty) agent.firstBuyNs = clockNs;
+          sold += q.tokens;
+          trades++; buys++;
+          checkMilestones(day);
+        } else {
+          const price = pricePerTokenYocto(sold);
+          const size = tradeSizeYocto();
+          let tokensToSell = size / price;
+          if (tokensToSell > agent.tokens) tokensToSell = agent.tokens;
+          if (tokensToSell === 0n) { clockNs += clockStepNs; continue; }
+          const gross = sellProceedsYocto(sold, tokensToSell);
+          if (gross === 0n) { clockNs += clockStepNs; continue; }
+          const fee = feeYocto(gross);
+          const net = gross - fee;
+          prizePool += fee;
+          nearReserve -= gross;
+          const avgCost = agent.tokens > 0n ? agent.costBasisYocto / agent.tokens : 0n;
+          const costOfSold = tokensToSell * avgCost;
+          agent.nearYocto += net;
+          agent.tokens -= tokensToSell;
+          agent.costBasisYocto -= costOfSold;
+          if (agent.tokens === 0n) agent.firstBuyNs = null;
+          sold -= tokensToSell;
+          trades++; sells++;
+        }
+        clockNs += clockStepNs;
+      }
+    }
+    runVote(day);
+    snapshots.push({
+      day,
+      priceYocto: pricePerTokenYocto(sold),
+      sold,
+      holders: holderCount(),
+      prizePoolYocto: prizePool,
+      totalSupply,
+      curveCap,
+    });
+  }
+
+  const voteBurns = votes.filter((v) => v.outcome === 'burn');
+  const voteMints = votes.filter((v) => v.outcome === 'mint');
+  const voteNones = votes.filter((v) => v.outcome === 'do nothing');
+  const voteNet = voteMints.reduce((s, v) => s + v.amount, 0n) - voteBurns.reduce((s, v) => s + v.amount, 0n);
+  return {
+    cfg: { ...cfg },
+    snapshots,
+    milestones,
+    votes,
+    voteBurns: voteBurns.length,
+    voteMints: voteMints.length,
+    voteNones: voteNones.length,
+    voteNet,
+    final: {
+      priceYocto: pricePerTokenYocto(sold),
+      startPriceYocto: pricePerTokenYocto(0n),
+      sold,
+      curveCap,
+      totalSupply,
+      burned,
+      minted,
+      holders: holderCount(),
+      prizePoolYocto: prizePool,
+      nearReserveYocto: nearReserve,
+      trades,
+      buys,
+      sells,
+    },
+  };
+}
+
+// ---------- charts ----------
+function supplyChart(values, unitLabel, formatFn) {
+  if (!values.length) return '<p class="muted">No points to chart yet.</p>';
+  const W = 640, H = 220, PL = 8, PR = 8, PT = 14, PB = 22;
+  let min = Math.min.apply(null, values), max = Math.max.apply(null, values);
+  if (min === max) { min = min * 0.9; max = max * 1.1; if (min === max) { min = 0; max = 1; } }
+  const n = values.length - 1;
+  const x = (i) => PL + (i / Math.max(1, n)) * (W - PL - PR);
+  const y = (v) => PT + (1 - (v - min) / (max - min)) * (H - PT - PB);
+  const d = values.map((v, i) => (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join(' ');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(unitLabel)} chart over 60 days">
+    <path d="${d}" fill="none" stroke="#d29922" stroke-width="2" />
+    <circle cx="${x(values.length - 1).toFixed(1)}" cy="${y(values[values.length - 1]).toFixed(1)}" r="4" fill="#d29922" />
+    <text x="${PL}" y="${PT - 2}" fill="#8b949e" font-size="11">high ${esc(formatFn(max))} ${esc(unitLabel)}</text>
+    <text x="${PL}" y="${H - 6}" fill="#8b949e" font-size="11">low ${esc(formatFn(min))} ${esc(unitLabel)}</text>
+    <text x="${W - PR}" y="${H - 6}" fill="#8b949e" font-size="11" text-anchor="end">day 0 to day 60</text>
+  </svg>`;
+}
+const fmtTokens = (v) => Math.round(v).toLocaleString('en-US');
+
+// ---------- rendering ----------
+let lastResults = null;
+function scenarioReadout(scen, result) {
+  const f = result.final;
+  const startSupply = TOTAL_SUPPLY_TOKENS;
+  const change = f.totalSupply - startSupply;
+  const changePct = Number(change * 10000n / startSupply) / 100;
+  const lines = [];
+  if (change > 0n) {
+    lines.push(`Supply grew by ${fmtInt(change.toString())} tokens (${changePct.toFixed(2)}% of the starting supply) over the 60 days.`);
+  } else if (change < 0n) {
+    lines.push(`Supply shrank by ${fmtInt((-change).toString())} tokens (${(-changePct).toFixed(2)}% of the starting supply) over the 60 days.`);
+  } else {
+    lines.push('Supply ended exactly where it started. Burns and mints cancelled each other out.');
+  }
+  if (result.votes.length === 0) {
+    lines.push('No vote ever executed, so voting moved nothing.');
+  } else if (result.voteNet > 0n) {
+    lines.push(`Voting grew the supply by ${fmtInt(result.voteNet.toString())} tokens net (${result.voteMints} mints, ${result.voteBurns} burns, ${result.voteNones} do nothing rounds).`);
+  } else if (result.voteNet < 0n) {
+    lines.push(`Voting shrank the supply by ${fmtInt((-result.voteNet).toString())} tokens net (${result.voteBurns} burns, ${result.voteMints} mints, ${result.voteNones} do nothing rounds).`);
+  } else {
+    lines.push(`Voting moved the supply both ways and ended net zero (${result.voteBurns} burns, ${result.voteMints} mints, ${result.voteNones} do nothing rounds).`);
+  }
+  if (result.milestones.length === 0) {
+    lines.push('No milestone fired. The holder count never reached 10, so the supply never reacted to holders.');
+  } else {
+    const firedDays = result.milestones.map((m) => `${m.holders} holders on day ${m.day}`).join(', ');
+    lines.push(`Milestones fired: ${firedDays}.`);
+    if (!result.milestones.some((m) => m.holders === 100)) {
+      lines.push('The 100 holder airdrop did not fire. It needs 100 agents holding at once.');
+    }
+  }
+  const startPrice = yoctoToNearFloat(f.startPriceYocto);
+  const endPrice = yoctoToNearFloat(f.priceYocto);
+  const multiple = startPrice > 0 ? endPrice / startPrice : 0;
+  lines.push(`The price ended at ${fmtPrice(f.priceYocto)} NEAR per token, ${multiple.toFixed(2)}x its start. ${fmtInt(f.sold.toString())} tokens sold on the curve, ${f.holders} holders at day 60, prize pool ${fmtNear(f.prizePoolYocto)} NEAR.`);
+  return lines;
+}
+function renderScenario(scen, result, idx) {
+  const f = result.final;
+  const startSupply = TOTAL_SUPPLY_TOKENS;
+  const change = f.totalSupply - startSupply;
+  const changePct = Number(change * 10000n / startSupply) / 100;
+  const supplies = result.snapshots.map((s) => Number(s.totalSupply));
+  const changeClass = change > 0n ? 'neg' : change < 0n ? 'pos' : '';
+  const voteSummary = result.votes.length
+    ? `${result.votes.length} votes: ${result.voteBurns} burn, ${result.voteMints} mint, ${result.voteNones} do nothing`
+    : 'No votes held';
+  const mileSummary = result.milestones.length
+    ? result.milestones.map((m) => `${m.holders} holders day ${m.day}`).join(', ')
+    : 'None fired';
+  return `
+  <section>
+    <p class="kicker">Scenario ${idx + 1} of 4</p>
+    <h2>${esc(scen.name)}</h2>
+    <p class="scen-setup">${esc(scen.setup)}</p>
+    <div class="panel">
+      <div class="kv" style="margin-bottom:14px;">
+        <span>Final supply, day 60</span><b>${fmtInt(f.totalSupply.toString())} tokens</b>
+        <span>Change from day 0</span><b class="${changeClass}">${change > 0n ? '+' : ''}${fmtInt(change.toString())} tokens (${change > 0n ? '+' : ''}${changePct.toFixed(2)}%)</b>
+        <span>Burned in total</span><b>${fmtInt(f.burned.toString())} tokens</b>
+        <span>Minted in total</span><b>${fmtInt(f.minted.toString())} tokens</b>
+        <span>Milestones fired</span><b>${esc(mileSummary)}</b>
+        <span>Votes</span><b>${esc(voteSummary)}</b>
+      </div>
+      ${supplyChart(supplies, 'tokens of supply', fmtTokens)}
+      <div class="chartnote"><span>day 0: ${fmtInt(startSupply.toString())} tokens</span><span>day 60: ${fmtInt(f.totalSupply.toString())} tokens</span></div>
+      <h3>Readout</h3>
+      <ul class="obs">${scenarioReadout(scen, result).map((o) => `<li>${esc(o)}</li>`).join('')}</ul>
+    </div>
+  </section>`;
+}
+function renderCompare(results) {
+  const rows = results.map(([scen, result]) => {
+    const f = result.final;
+    const change = f.totalSupply - TOTAL_SUPPLY_TOKENS;
+    const changePct = Number(change * 10000n / TOTAL_SUPPLY_TOKENS) / 100;
+    const startPrice = yoctoToNearFloat(f.startPriceYocto);
+    const endPrice = yoctoToNearFloat(f.priceYocto);
+    const multiple = startPrice > 0 ? endPrice / startPrice : 0;
+    return `<tr><td>${esc(scen.name)}</td><td>${fmtInt(f.totalSupply.toString())}</td><td>${change > 0n ? '+' : ''}${fmtInt(change.toString())} (${change > 0n ? '+' : ''}${changePct.toFixed(2)}%)</td><td>${result.milestones.length} of 3</td><td>${result.votes.length} (${result.voteBurns} burn, ${result.voteMints} mint)</td><td>${multiple.toFixed(2)}x</td></tr>`;
+  }).join('');
+  $('compareBox').innerHTML = `<table><thead><tr><th>Scenario</th><th>Final supply</th><th>Change</th><th>Milestones</th><th>Votes</th><th>Price</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function runAll() {
+  const results = SCENARIOS.map((scen) => [scen, runSimulation(scen.cfg)]);
+  lastResults = results;
+  $('scenarios').innerHTML = results.map(([scen, result], i) => renderScenario(scen, result, i)).join('');
+  renderCompare(results);
+  const totalTrades = results.reduce((s, [, r]) => s + r.final.trades, 0);
+  $('runNote').textContent = `Done: 4 scenarios, 60 days each, ${totalTrades.toLocaleString('en-US')} trades in total. Fixed seeds, so the numbers never change between runs.`;
+  status('All four scenarios done.', 8000);
+}
+function resetScenarios() {
+  runAll();
+}
+
+// Exposed for tests: the pure curve math, the full simulation, the
+// scenario list, and the last rendered results.
+window.__supplySim = {
+  pricePerTokenYocto, buyTokensForNear, sellProceedsYocto, feeYocto,
+  runSimulation, mulberry32, SCENARIOS,
+  state: () => ({ lastResults }),
+};
+runAll();
+</script>
+</body>
+</html>
