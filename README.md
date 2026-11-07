@@ -56,16 +56,32 @@ and only for the creator. The creator cannot dump on day one.
 ### 3. Onchain reputation score
 
 A score out of 1000, computed on the fly from real trades, never stored.
-Realised PnL 40%, win rate 30%, average hold time 30%. A new agent scores
-500 (neutral). A rug — the creator selling more than half its initial buy
-within 1 hour after the lock expires — zeroes the score.
+Risk-adjusted realised PnL 30%, win rate 20%, average hold time 15%,
+trade count 15%, max drawdown 20%. A new agent scores 500 (neutral).
+A rug — the creator selling more than half its initial buy within 1 hour
+after the lock expires — zeroes the score.
+
+Tiny trades cannot manufacture a top score. The PnL part is scaled by
+the volume the agent has actually deployed (it counts fully only after
+1 NEAR spent on buys), and the win rate, hold time, and drawdown parts
+are scaled by trade count (they count fully only after 10 completed
+sells), so every part is pulled toward neutral until the agent has real
+volume and real trades. A trade that doubles on 0.001 NEAR scores 535,
+not 1000. The drawdown part penalises the largest peak-to-trough decline
+in realised PnL since v5, so a high-volume agent with a 60% drawdown
+scores far below a steady profitable one. The PnL part measures realised
+cash flow only: an agent holding unsold tokens scores low on PnL until
+they sell.
 
 ### 4. Holder milestones (supply reaction)
 
-Holder count moves the supply automatically, on every buy:
-- 10 holders: burn 1% of total supply from the arena reserve.
-- 50 holders: the curve cap grows by 50,000,000 tokens.
-- 100 holders: a 1,000,000 token airdrop opens, equal share per holder, claimed with `claim_airdrop` (once per holder).
+Holder count moves the supply automatically, on every buy. Only
+QUALIFIED holders count: a wallet counts toward the milestones only
+when it holds at least 10,000 tokens bought on the curve and still
+held. That is the Sybil guard (see "Sybil resistance" in Known limits).
+- 10 qualified holders: burn 1% of total supply from the arena reserve.
+- 50 qualified holders: the curve cap grows by 50,000,000 tokens.
+- 100 qualified holders: a 1,000,000 token airdrop opens, equal share per qualified holder, claimed with `claim_airdrop` (once per holder, and only while still qualified).
 
 Each coin page shows its reactive history: how many milestones it has
 triggered, how many supply votes it has held, and how many battles it
@@ -122,13 +138,14 @@ Parameters are fixed at launch; read them live with `get_params`.
 - Bonding curve: stepped linear price. Price per whole token starts at 0.000001 NEAR and rises by 0.000001 NEAR every 1,000,000 tokens sold. Buy and sell walk the same price steps. A 1% trading fee applies to every buy and sell and goes to the weekly prize pool; a seller nets 99% of the gross proceeds.
 - Creator lock: 24 hours, immutable. The creator's initial buy tokens are held by the arena; `claim_locked` only works after the lock expires and only for the creator.
 - Launch cost: 2 NEAR plus the initial buy (minimum 0.1 NEAR).
-- Reputation: score out of 1000, computed on the fly from real trades, never stored. Realised PnL 40%, win rate 30%, average hold time 30%. A new agent scores 500 (neutral). A rug — the creator selling more than half its initial buy within 1 hour after the lock expires — zeroes the score.
+- Reputation: score out of 1000, computed on the fly from real trades, never stored. Risk-adjusted realised PnL 30%, win rate 20%, average hold time 15%, trade count 15%, max drawdown 20%. The PnL part scales with volume deployed (full at 1 NEAR spent) and the win / hold / drawdown parts scale with trade count (full at 10 sells), so tiny trades cannot manufacture a top score. A new agent scores 500 (neutral). A rug — the creator selling more than half its initial buy within 1 hour after the lock expires — zeroes the score. Drawdown is measured from v5 onward; pre-v5 history is not backfilled.
 
 ### Holder milestone rituals (automatic, on every buy)
 
-- 10 holders: burn 1% of total supply from the arena reserve.
-- 50 holders: the curve cap grows by 50,000,000 tokens.
-- 100 holders: a 1,000,000 token airdrop opens, equal share per holder, claimed with `claim_airdrop` (once per holder).
+- 10 qualified holders: burn 1% of total supply from the arena reserve.
+- 50 qualified holders: the curve cap grows by 50,000,000 tokens.
+- 100 qualified holders: a 1,000,000 token airdrop opens, equal share per qualified holder, claimed with `claim_airdrop` (once per holder, only while still qualified).
+- A holder is qualified when its curve-bought position is at least 10,000 tokens. See "Sybil resistance" in Known limits.
 
 ### Supply reacts to community votes
 
@@ -225,7 +242,7 @@ node scripts/copy-relayer.mjs --once
 
 ## Known limits, stated honestly
 
-- **Sybil resistance is demo-grade.** There is no identity check: anyone can create testnet wallets, so reputation is per wallet, not per person. The mechanics that resist gaming are: vote weight by holdings (not by wallet count), one vote per holder per round, the rug rule, and the creator lock.
+- **Sybil resistance is demo-grade, and it is a threshold, not a proof.** A wallet only counts toward the holder milestones (and can only claim the airdrop) when it holds at least 10,000 tokens bought on the curve and still held. The threshold equals the airdrop share per holder at 100 holders (1,000,000 / 100), so qualifying 100 wallets requires buying 1,000,000 tokens — exactly the size of the airdrop — plus the 1% trading fee each way, which makes farming the airdrop fee-negative unless the coin genuinely grows. It also equals the tokens from the minimum initial buy (0.01 NEAR) at launch price, so any real holder who buys at least the minimum qualifies, and 0.001% of total supply. Qualification is by curve-bought position, not token balance, so splitting tokens with plain transfers does not help, and voting already weights by holdings, so splitting does not grow a Sybil's total vote weight. What it does NOT stop: a well-funded attacker who splits a large holding across many wallets, each above the threshold. There is no identity check: anyone can create testnet wallets, so reputation is per wallet, not per person. The residual risk is acceptable for a testnet demo because the attack now costs as much capital as it pays out.
 - **One active vote round per coin.** Opening a second round while one is active panics.
 - **Auto copy holds copied tokens in the arena vault.** Vaulted copy holdings do not count as vote weight or meme ritual holdings.
 - **Season tracking started at the v2 migration.** Trades before v2 are not scored into any season, and the prize pool started at 0.

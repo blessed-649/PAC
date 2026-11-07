@@ -8,14 +8,22 @@
 //!   1. Public agent wallets — every agent is a named NEAR account.
 //!   2. Creator lock — an agent's initial buy is locked 24h, held by the
 //!      arena, claimable only after the lock expires.
-//!   3. Reputation score (0-1000) — realised PnL 40%, win rate 30%,
-//!      average hold time 30%. A rug zeroes the score.
+//!   3. Reputation score (0-1000) — risk-adjusted realised PnL 30%,
+//!      win rate 20%, average hold time 15%, trade count 15%, max
+//!      drawdown 20%. A tiny trade that doubles cannot manufacture a
+//!      top score: the PnL part scales with volume deployed and the
+//!      win / hold / drawdown parts scale with trade count. A rug
+//!      zeroes the score.
 //!   4. Agent battles — two wallets stake a 0.1 NEAR forfeit, 24h window,
 //!      the contract compares realised PnL on the battle coin and pays the
 //!      winner automatically.
-//!   5. Holder milestones — at 10 holders 1% of supply is burned, at 50
-//!      a 50M-token treasury tranche joins the curve, at 100 holders a
-//!      1M-token airdrop opens (equal share, one claim each).
+//!   5. Holder milestones — at 10 QUALIFIED holders 1% of supply is
+//!      burned, at 50 a 50M-token treasury tranche joins the curve, at
+//!      100 holders a 1M-token airdrop opens (equal share, one claim
+//!      each). A holder only counts if it holds at least 10,000 tokens
+//!      bought on the curve and still held, so one person cannot farm
+//!      the airdrop with 100 empty wallets (see the Sybil note in the
+//!      parameters below).
 //!   6. Community supply votes — holders vote (weight = curve holdings,
 //!      one vote each) on burn 2%, mint 2%, or do nothing; the winner
 //!      executes onchain after the deadline.
@@ -95,10 +103,25 @@ pub const BATTLE_FORFEIT_YOCTO: u128 = 100_000_000_000_000_000_000_000;
 pub const LAUNCH_COST_YOCTO: u128 = 2_000_000_000_000_000_000_000_000;
 /// Minimum initial buy at launch, yoctoNEAR (0.01 NEAR).
 pub const MIN_INITIAL_BUY_YOCTO: u128 = 10_000_000_000_000_000_000_000;
-/// Reputation weights (must sum to 100).
-pub const REP_W_PNL: u64 = 40;
-pub const REP_W_WIN: u64 = 30;
-pub const REP_W_HOLD: u64 = 30;
+/// Reputation weights (must sum to 100). v5: realised PnL (risk-adjusted
+/// and volume-scaled) 30, win rate 20, hold time 15, trade count 15,
+/// max drawdown 20. A tiny trade that doubles cannot manufacture a top
+/// score: the PnL part is scaled by volume deployed, and the win / hold
+/// / drawdown parts are scaled by trade count, so every part is pulled
+/// toward neutral (500) until the agent has real volume and real trades.
+pub const REP_W_PNL: u64 = 30;
+pub const REP_W_WIN: u64 = 20;
+pub const REP_W_HOLD: u64 = 15;
+pub const REP_W_COUNT: u64 = 15;
+pub const REP_W_DD: u64 = 20;
+/// Total NEAR an agent must have deployed (spent on buys) for the PnL
+/// component to count fully: 1 NEAR. Below that, the PnL part is scaled
+/// toward neutral in proportion to volume deployed.
+pub const VOLUME_FULL_YOCTO: u128 = 1_000_000_000_000_000_000_000_000;
+/// Completed sells at which the trade-count, win-rate, hold-time and
+/// drawdown components count fully: 10. Below that, each is scaled
+/// toward neutral in proportion to sells.
+pub const COUNT_FULL: u64 = 10;
 /// Rug window: if a creator sells more than half its initial buy within
 /// this long after the lock expires, it is flagged as a rugger.
 pub const RUG_WINDOW_NS: u64 = 60 * 60 * 1_000_000_000;
@@ -107,11 +130,38 @@ pub const HOLD_FULL_HOURS: u64 = 24;
 /// One yoctoNEAR attached to ft_transfer calls (NEP-141 requirement).
 pub const FT_TRANSFER_DEPOSIT: u128 = 1;
 
-// Holder milestones: when a coin's holder count first reaches these
-// numbers, the contract acts automatically (see check_milestones).
+// Holder milestones: when a coin's QUALIFIED holder count first reaches
+// these numbers, the contract acts automatically (see check_milestones).
+// A holder only counts if it holds at least
+// MIN_QUALIFIED_HOLDING_TOKENS of the coin bought on the curve and
+// still held (see below). Raw wallet count is not used: without this,
+// one person could create 100 empty wallets, trigger the 100-holder
+// airdrop, and collect it for free.
 pub const MILESTONE_HOLDERS_1: u64 = 10;
 pub const MILESTONE_HOLDERS_2: u64 = 50;
 pub const MILESTONE_HOLDERS_3: u64 = 100;
+/// Minimum curve-bought holding, whole tokens, for a wallet to count
+/// as a holder for milestones (and to claim the airdrop): 10,000.
+/// Three equalities justify this number, and all three are asserted
+/// in the unit tests:
+/// - it equals the airdrop share per holder at 100 holders
+///   (1,000,000 / 100), so qualifying 100 wallets requires buying
+///   1,000,000 tokens — exactly the size of the airdrop. The attacker
+///   must deploy as much capital into the curve as the airdrop pays.
+/// - it equals the tokens from the minimum initial buy (0.01 NEAR)
+///   at launch price (0.000001 NEAR per token), so any real holder
+///   who buys at least the minimum at launch qualifies.
+/// - it equals 0.001% of the 1,000,000,000 total supply.
+/// Attack economics: the round trip pays the 1% trading fee on the
+/// buy and 1% on the sell, and the curve only lets the attacker
+/// liquidate up to the sold amount, so farming the airdrop is
+/// fee-negative and only pays if the coin genuinely grows — at which
+/// point the "attacker" is just a holder. This does NOT stop a
+/// well-funded attacker who splits a large holding across many
+/// wallets, each above the threshold; see the README for the honest
+/// limits. Qualification is by curve-bought position, not token
+/// balance, so splitting tokens with plain transfers does not help.
+pub const MIN_QUALIFIED_HOLDING_TOKENS: u128 = 10_000;
 /// Burned at 10 holders, basis points of total supply (100 = 1%).
 pub const MILESTONE_BURN_BP: u128 = 100;
 /// Tokens added to the curve cap at 50 holders (treasury tranche unlock).
@@ -228,6 +278,12 @@ pub struct Coin {
     /// Accounts that already claimed the airdrop.
     pub airdrop_claimed: Vec<AccountId>,
     pub holders: Vec<AccountId>,
+    /// Cached count of QUALIFIED holders: holders whose curve-bought
+    /// position is at least MIN_QUALIFIED_HOLDING_TOKENS tokens. This
+    /// is the count milestones use (see fire_milestones), not
+    /// holders.len(). Maintained incrementally on every buy and sell,
+    /// so a milestone check never scans the holder list.
+    pub qualified_holders: u64,
     /// Optional image URL for the coin (v4). Set at launch or later by
     /// the creator with set_coin_image. Coins minted before v4 read
     /// back as None; the v4 migrate() rebuilds them with None.
@@ -247,6 +303,25 @@ pub struct AgentStats {
     pub coins_launched: u64,
     pub battles_played: u64,
     pub battles_won: u64,
+}
+
+/// v5 reputation extension, kept in its own collection so the v4
+/// AgentStats bytes keep deserialising unchanged. Tracks what the v4
+/// stats could not: the agent's cumulative realised PnL, its peak,
+/// and its maximum drawdown (peak-to-trough decline in realised PnL).
+/// Drawdown is measured from v5 onward; pre-v5 history is not
+/// backfilled (the contract cannot enumerate past agents to rebuild
+/// it). A fresh agent reads back all zeros, which the drawdown
+/// component treats as neutral.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Default)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AgentRep {
+    /// Cumulative realised PnL since v5, yoctoNEAR (can be negative).
+    pub realised_pnl_yocto: i128,
+    /// Highest cumulative realised PnL reached since v5.
+    pub peak_realised_yocto: i128,
+    /// Largest peak-to-trough decline in realised PnL since v5, yoctoNEAR.
+    pub max_drawdown_yocto: u128,
 }
 
 /// One agent's open position in one coin (cost basis for win rate and PnL).
@@ -459,6 +534,18 @@ pub struct ParamsView {
     pub rep_weight_pnl: u64,
     pub rep_weight_win_rate: u64,
     pub rep_weight_hold_time: u64,
+    /// Trade-count weight (v5) and drawdown weight (v5).
+    pub rep_weight_trade_count: u64,
+    pub rep_weight_drawdown: u64,
+    /// Total NEAR an agent must have deployed for the PnL component
+    /// to count fully (v5).
+    pub volume_full_yocto: String,
+    /// Completed sells at which the count-scaled components count
+    /// fully (v5).
+    pub count_full: u64,
+    /// Minimum curve-bought holding, whole tokens, for a wallet to
+    /// count as a holder for milestones and to claim the airdrop (v5).
+    pub min_qualified_holding_tokens: String,
     pub rug_window_ns: u64,
     pub hold_full_hours: u64,
     pub milestone_holders: Vec<u64>,
@@ -510,6 +597,10 @@ pub struct CoinView {
     pub unlock_at_ns: u64,
     pub lock_status: String,
     pub holders: u64,
+    /// Holders whose curve-bought position is at least
+    /// MIN_QUALIFIED_HOLDING_TOKENS tokens: the count the holder
+    /// milestones use (v5). Raw wallet count is `holders`.
+    pub qualified_holders: u64,
     pub price_per_token_yocto: String,
     pub market_cap_yocto: String,
     pub near_reserve_yocto: String,
@@ -535,6 +626,9 @@ pub struct AgentView {
     pub winning_sells: u64,
     pub win_rate_bp: u64,
     pub avg_hold_hours: u64,
+    /// Largest peak-to-trough decline in realised PnL since v5,
+    /// yoctoNEAR (v5). 0 for an agent with no v5 sells.
+    pub max_drawdown_yocto: String,
     pub rugged: bool,
     pub coins_launched: u64,
     pub battles_played: u64,
@@ -761,6 +855,32 @@ pub fn sell_proceeds_yocto(from_sold: u128, tokens: u128) -> u128 {
     proceeds
 }
 
+/// Fraction (0-1000) of the PnL component that counts, by volume
+/// deployed: 0 with no volume, 1000 once the agent has spent
+/// VOLUME_FULL_YOCTO (1 NEAR) on buys.
+fn volume_factor(spent_yocto: u128) -> u64 {
+    ((spent_yocto.min(VOLUME_FULL_YOCTO) * 1000) / VOLUME_FULL_YOCTO) as u64
+}
+
+/// Fraction (0-1000) of the count-scaled components that counts, by
+/// completed sells: 0 with no sells, 1000 at COUNT_FULL (10) sells.
+fn count_factor(sells: u64) -> u64 {
+    ((sells.min(COUNT_FULL) as u128 * 1000) / COUNT_FULL as u128) as u64
+}
+
+/// Pull a raw 0-1000 component toward neutral (500) by a 0-1000
+/// factor: factor 0 returns 500, factor 1000 returns the raw value.
+fn scale_toward_neutral(raw: u16, factor_1000: u64) -> u16 {
+    (500 + (raw as i64 - 500) * factor_1000 as i64 / 1000) as u16
+}
+
+/// PnL component (0-1000), risk-adjusted by volume deployed. The raw
+/// return is PnL in basis points of total spent, mapped 500 + bp/20
+/// and clamped to 0-1000 (so +100% is 1000, -100% is 0). That raw
+/// value is then scaled toward neutral by the volume factor: a trade
+/// that doubles on 0.001 NEAR scores ~500 here, because almost no
+/// capital was risked; only an agent that has deployed real volume
+/// can score near 1000 on PnL.
 fn pnl_component(spent: u128, received: u128) -> u16 {
     if spent == 0 {
         return 500;
@@ -773,33 +893,77 @@ fn pnl_component(spent: u128, received: u128) -> u16 {
     if bp < -10_000 {
         bp = -10_000;
     }
-    (500 + bp / 20).clamp(0, 1000) as u16
+    let raw = (500 + bp / 20).clamp(0, 1000) as u16;
+    scale_toward_neutral(raw, volume_factor(spent))
 }
 
+/// Win-rate component (0-1000): the share of sells that won, scaled
+/// toward neutral by the trade-count factor. One lucky win is 550,
+/// not 1000; ten wins at 100% is 1000.
 fn win_component(sells: u64, wins: u64) -> u16 {
     if sells == 0 {
         return 500;
     }
-    ((wins as u128 * 1000) / sells as u128) as u16
+    let raw = ((wins as u128 * 1000) / sells as u128) as u16;
+    scale_toward_neutral(raw, count_factor(sells))
 }
 
+/// Hold-time component (0-1000): average hold time, full marks at
+/// HOLD_FULL_HOURS (24h), scaled toward neutral by the trade-count
+/// factor (the count here is hold_count, the sells with a position).
 fn hold_component(total_ns: u128, count: u64) -> u16 {
     if count == 0 {
         return 500;
     }
     let avg_hours = total_ns / count as u128 / 3_600_000_000_000u128;
-    (avg_hours * 1000 / HOLD_FULL_HOURS as u128).min(1000) as u16
+    let raw = (avg_hours * 1000 / HOLD_FULL_HOURS as u128).min(1000) as u16;
+    scale_toward_neutral(raw, count_factor(count))
+}
+
+/// Trade-count component (0-1000): experience. 500 with no sells,
+/// rising to 1000 at COUNT_FULL (10) sells. An agent with very few
+/// trades cannot reach a top score, however good its other parts are.
+fn count_component(sells: u64) -> u16 {
+    500 + (500 * count_factor(sells) / 1000) as u16
+}
+
+/// Drawdown component (0-1000): penalises the agent's maximum
+/// peak-to-trough decline in realised PnL, measured as basis points
+/// of total volume deployed. No drawdown is 1000, a drawdown equal
+/// to the whole deployed volume is 0. Scaled toward neutral by the
+/// trade-count factor, and 500 with no sells (no drawdown data yet).
+fn drawdown_component(sells: u64, max_drawdown_yocto: u128, spent_yocto: u128) -> u16 {
+    if sells == 0 {
+        return 500;
+    }
+    let base = spent_yocto.max(1);
+    let dd_bp = (max_drawdown_yocto.saturating_mul(10_000) / base).min(10_000);
+    let raw = (1000 - dd_bp / 10) as u16;
+    scale_toward_neutral(raw, count_factor(sells))
 }
 
 /// Deterministic reputation score, 0-1000. A rugged agent scores 0.
-pub fn compute_score(s: &AgentStats) -> u16 {
+/// A new agent scores 500 (every component is neutral with no data).
+/// Weights: PnL 30, win rate 20, hold time 15, trade count 15,
+/// drawdown 20. Every component except trade count is scaled toward
+/// neutral until the agent has deployed real volume (PnL) or made
+/// real trades (win / hold / drawdown), so a tiny-trade farmer cannot
+/// manufacture a high score.
+pub fn compute_score(s: &AgentStats, rep: &AgentRep) -> u16 {
     if s.rugged {
         return 0;
     }
     let pnl = pnl_component(s.total_spent_yocto, s.total_received_yocto);
     let win = win_component(s.sells, s.winning_sells);
     let hold = hold_component(s.hold_time_total_ns, s.hold_count);
-    ((REP_W_PNL * pnl as u64 + REP_W_WIN * win as u64 + REP_W_HOLD * hold as u64) / 100) as u16
+    let count = count_component(s.sells);
+    let dd = drawdown_component(s.sells, rep.max_drawdown_yocto, s.total_spent_yocto);
+    ((REP_W_PNL * pnl as u64
+        + REP_W_WIN * win as u64
+        + REP_W_HOLD * hold as u64
+        + REP_W_COUNT * count as u64
+        + REP_W_DD * dd as u64)
+        / 100) as u16
 }
 
 pub fn score_band(score: u16) -> &'static str {
@@ -1002,14 +1166,21 @@ pub struct Contract {
     meme_texts: LookupMap<String, String>,
     /// "coin_id:day:submission_index" -> the NEAR AI judge's score.
     ai_scores: LookupMap<String, AiScore>,
+    // --- v5 fields (appended after the v3 fields, so the v4 Borsh
+    // layout is preserved and migrate() can copy the old state) ---
+    /// Per-agent reputation extension (v5): realised PnL, peak, max
+    /// drawdown. Kept in its own collection (prefix "r") so the v4
+    /// AgentStats map deserialises unchanged. Starts empty at v5.
+    agent_rep: LookupMap<AccountId, AgentRep>,
 }
 
-/// The v3 coin record, kept verbatim so migrate() can deserialise the
-/// live v3 coin bytes. Field order and types must match the v3 Coin
-/// exactly; do not edit. The v4 Coin adds image_url at the end, so the
-/// v3 bytes cannot deserialise as a v4 Coin and migrate() rebuilds each
-/// coin with image_url None instead. BorshSerialize is derived so the
-/// LookupMap type bounds hold; its bytes are identical to the v3 Coin.
+/// The v4 coin record, kept verbatim so migrate() can deserialise the
+/// live v4 coin bytes. Field order and types must match the v4 Coin
+/// exactly; do not edit. The v5 Coin adds qualified_holders, so the
+/// v4 bytes cannot deserialise as a v5 Coin and migrate() rebuilds
+/// each coin with its qualified holder count computed from positions.
+/// BorshSerialize is derived so the LookupMap type bounds hold; its
+/// bytes are identical to the v4 Coin.
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct OldCoin {
     pub id: u64,
@@ -1034,13 +1205,15 @@ pub struct OldCoin {
     pub airdrop_per_holder: u128,
     pub airdrop_claimed: Vec<AccountId>,
     pub holders: Vec<AccountId>,
+    pub image_url: Option<String>,
 }
 
-/// The v3 contract state, kept verbatim so migrate() can deserialise
-/// the live v3 bytes and rebuild the v4 state from them. Field order
-/// and types must match the v3 Contract exactly; do not edit. The
-/// coins map holds OldCoin records (see above) because the v4 Coin
-/// adds image_url and the v3 coin bytes cannot deserialise as v4 Coins.
+/// The v4 contract state, kept verbatim so migrate() can deserialise
+/// the live v4 bytes and rebuild the v5 state from them. Field order
+/// and types must match the v4 Contract exactly; do not edit. The
+/// coins map holds OldCoin records (see above) because the v5 Coin
+/// adds qualified_holders and the v4 coin bytes cannot deserialise
+/// as v5 Coins. The v5 Contract adds agent_rep at the end.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -1064,10 +1237,10 @@ pub struct OldContract {
     seasons: LookupMap<u64, Season>,
     season_pnl: LookupMap<String, i128>,
     /// "coin_id:day:submission_index" -> the meme text the AI judge
-    /// reads (v3 field; same position as in the v3 Contract).
+    /// reads (v4 field; same position as in the v4 Contract).
     meme_texts: LookupMap<String, String>,
     /// "coin_id:day:submission_index" -> the NEAR AI judge's score
-    /// (v3 field; same position as in the v3 Contract).
+    /// (v4 field; same position as in the v4 Contract).
     ai_scores: LookupMap<String, AiScore>,
 }
 
@@ -1098,37 +1271,56 @@ impl Contract {
             season_pnl: LookupMap::new(b"n"),
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
+            agent_rep: LookupMap::new(b"r"),
         }
     }
 
-    /// Migrate the live v3 state to v4 without wiping it. Deploy the
-    /// v4 WASM over the v3 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v3 field and collection
+    /// Migrate the live v4 state to v5 without wiping it. Deploy the
+    /// v5 WASM over the v4 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v4 field and collection
     /// verbatim (agents, positions, battles, vote rounds, coin duels,
     /// meme days, meme texts, AI scores, activity, prize pool, follows,
-    /// copy positions, seasons), and rebuilds each coin as a v4 Coin
-    /// with image_url None: the v3 coin Borsh bytes carry no image_url
-    /// field, so they cannot deserialise as v4 Coins. Coin ids are
-    /// sequential from 0, so the rebuild walks 0..coin_count and skips
-    /// ids with no stored coin (a failed launch leaves a gap). The new
-    /// coins map reuses the same storage prefix, so each converted coin
-    /// overwrites its old bytes at the same key. No new collections are
-    /// needed: the image lives on the coin itself. Calling migrate()
-    /// twice fails: after the first call the stored state is v4, which
-    /// no longer deserialises as v3.
+    /// copy positions, seasons), and rebuilds each coin as a v5 Coin
+    /// with its qualified holder count computed from the holders'
+    /// curve positions (a holder qualifies when its curve-bought
+    /// position is at least MIN_QUALIFIED_HOLDING_TOKENS tokens). The
+    /// v4 coin Borsh bytes carry no qualified_holders field, so they
+    /// cannot deserialise as v5 Coins. Coin ids are sequential from 0,
+    /// so the rebuild walks 0..coin_count and skips ids with no stored
+    /// coin (a failed launch leaves a gap). The new coins map reuses
+    /// the same storage prefix, so each converted coin overwrites its
+    /// old bytes at the same key. The new agent_rep collection starts
+    /// empty: drawdown and realised PnL are measured from v5 onward
+    /// only, and pre-v5 history is not backfilled (the contract cannot
+    /// enumerate past agents to rebuild it). Calling migrate() twice
+    /// fails: after the first call the stored state is v5, which no
+    /// longer deserialises as v4.
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v3 state to migrate");
+        let old: OldContract = env::state_read().expect("no v4 state to migrate");
         let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
         for id in 0..old.coin_count {
             if let Some(oc) = old.coins.get(&id).cloned() {
+                // Count qualified holders from the curve positions:
+                // a holder qualifies when its bought position is at
+                // least the threshold. Positions are keyed
+                // "account:coin_id" (see position_key).
+                let mut qualified_holders = 0u64;
+                for holder in oc.holders.iter() {
+                    let key = Self::position_key(holder, id);
+                    if let Some(pos) = old.positions.get(&key) {
+                        if pos.bought_tokens >= MIN_QUALIFIED_HOLDING_TOKENS {
+                            qualified_holders += 1;
+                        }
+                    }
+                }
                 // NOTE: set(), not insert(). insert() loads the previous
                 // value at the key so it can return it, and the stored
-                // value here is still v3 coin bytes, which cannot
-                // deserialise as a v4 Coin (no image_url field) and
-                // would panic with "Cannot deserialize element". set()
-                // only marks the cache entry modified, so the v4 bytes
-                // overwrite the v3 bytes at the same key on flush.
+                // value here is still v4 coin bytes, which cannot
+                // deserialise as a v5 Coin (no qualified_holders field)
+                // and would panic with "Cannot deserialize element".
+                // set() only marks the cache entry modified, so the v5
+                // bytes overwrite the v4 bytes at the same key on flush.
                 coins.set(id, Some(Coin {
                     id: oc.id,
                     token_id: oc.token_id,
@@ -1152,7 +1344,8 @@ impl Contract {
                     airdrop_per_holder: oc.airdrop_per_holder,
                     airdrop_claimed: oc.airdrop_claimed,
                     holders: oc.holders,
-                    image_url: None,
+                    qualified_holders,
+                    image_url: oc.image_url,
                 }));
             }
         }
@@ -1179,6 +1372,7 @@ impl Contract {
             season_pnl: old.season_pnl,
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
+            agent_rep: LookupMap::new(b"r"),
         }
     }
 
@@ -1199,6 +1393,38 @@ impl Contract {
 
     fn get_agent_stats(&self, agent: &AccountId) -> AgentStats {
         self.agents.get(agent).cloned().unwrap_or_default()
+    }
+
+    fn get_agent_rep(&self, agent: &AccountId) -> AgentRep {
+        self.agent_rep.get(agent).cloned().unwrap_or_default()
+    }
+
+    /// Record a realised PnL delta for an agent's v5 reputation record:
+    /// update the cumulative realised PnL, its peak, and the maximum
+    /// drawdown (peak-to-trough decline). Called on every sell (curve
+    /// sell in ft_on_transfer and vaulted copy sell in copy_sell).
+    /// Drawdown is measured from v5 onward; an agent with no v5 sells
+    /// reads back all zeros, which the drawdown component treats as
+    /// neutral.
+    fn record_realised(&mut self, agent: &AccountId, delta_yocto: i128) {
+        let mut rep = self.get_agent_rep(agent);
+        rep.realised_pnl_yocto += delta_yocto;
+        if rep.realised_pnl_yocto > rep.peak_realised_yocto {
+            rep.peak_realised_yocto = rep.realised_pnl_yocto;
+        }
+        let dd = (rep.peak_realised_yocto - rep.realised_pnl_yocto).max(0) as u128;
+        if dd > rep.max_drawdown_yocto {
+            rep.max_drawdown_yocto = dd;
+        }
+        self.agent_rep.insert(agent.clone(), rep);
+    }
+
+    /// A curve-bought position of at least MIN_QUALIFIED_HOLDING_TOKENS
+    /// tokens counts as a qualified holding for milestones and the
+    /// airdrop. Qualification is by curve position, not token balance,
+    /// so tokens received by plain transfer or airdrop do not qualify.
+    fn is_qualified_holding(bought_tokens: u128) -> bool {
+        bought_tokens >= MIN_QUALIFIED_HOLDING_TOKENS
     }
 
     fn record_event(&mut self, kind: &str, agent: AccountId, coin_id: u64, tokens: u128, near: u128, note: String) {
@@ -1239,6 +1465,10 @@ impl Contract {
             unlock_at_ns: coin.unlock_at_ns,
             lock_status,
             holders: coin.holders.len() as u64,
+            /// Qualified holders (curve-bought position at least
+            /// MIN_QUALIFIED_HOLDING_TOKENS tokens): the count the
+            /// holder milestones use. Raw wallet count is `holders`.
+            qualified_holders: coin.qualified_holders,
             price_per_token_yocto: price.to_string(),
             market_cap_yocto: price.saturating_mul(coin.total_supply_tokens).to_string(),
             near_reserve_yocto: coin.near_reserve_yocto.to_string(),
@@ -1253,7 +1483,8 @@ impl Contract {
 
     fn agent_view(&self, account: &AccountId) -> AgentView {
         let s = self.get_agent_stats(account);
-        let score = compute_score(&s);
+        let rep = self.get_agent_rep(account);
+        let score = compute_score(&s, &rep);
         let realised = s.total_received_yocto as i128 - s.total_spent_yocto as i128;
         let win_rate_bp = if s.sells == 0 {
             0
@@ -1276,6 +1507,7 @@ impl Contract {
             winning_sells: s.winning_sells,
             win_rate_bp,
             avg_hold_hours,
+            max_drawdown_yocto: rep.max_drawdown_yocto.to_string(),
             rugged: s.rugged,
             coins_launched: s.coins_launched,
             battles_played: s.battles_played,
@@ -1420,6 +1652,13 @@ impl Contract {
                     airdrop_per_holder: 0,
                     airdrop_claimed: vec![],
                     holders: vec![creator.clone()],
+                    // The creator qualifies from launch when the
+                    // initial buy meets the threshold. The minimum
+                    // initial buy (0.01 NEAR) buys exactly 10,000
+                    // tokens at launch price, so a creator always
+                    // qualifies; the check keeps the invariant honest
+                    // if the minimum ever changes.
+                    qualified_holders: if Self::is_qualified_holding(tokens.0) { 1 } else { 0 },
                     image_url,
                 };
                 self.coins.insert(coin_id, coin);
@@ -1526,14 +1765,22 @@ impl Contract {
                 if !coin.holders.contains(&buyer) {
                     coin.holders.push(buyer.clone());
                 }
-                self.coins.insert(coin_id, coin);
+                // Qualified-holder bookkeeping: a buy only ever moves
+                // a position upward, so it can only qualify a holder,
+                // never unqualify one. The cached count is incremented
+                // exactly when the position crosses the threshold.
                 let key = Self::position_key(&buyer, coin_id);
                 let mut pos = self.positions.get(&key).cloned().unwrap_or_default();
+                let was_qualified = Self::is_qualified_holding(pos.bought_tokens);
                 if pos.bought_tokens == 0 {
                     pos.first_buy_ns = env::block_timestamp();
                 }
                 pos.bought_tokens += tokens.0;
                 pos.spent_yocto += cost_yocto.0;
+                if !was_qualified && Self::is_qualified_holding(pos.bought_tokens) {
+                    coin.qualified_holders += 1;
+                }
+                self.coins.insert(coin_id, coin);
                 self.positions.insert(key, pos);
                 self.track_agent(&buyer);
                 let mut stats = self.get_agent_stats(&buyer);
@@ -1551,9 +1798,10 @@ impl Contract {
                     Promise::new(buyer)
                         .transfer(NearToken::from_yoctonear(attached_yocto.0 - cost_yocto.0));
                 }
-                // Holder milestones fire automatically when the holder count
-                // crosses 10 / 50 / 100. The 10-holder burn needs a token
-                // call, so it returns a promise chained to its callback.
+                // Holder milestones fire automatically when the
+                // qualified holder count crosses 10 / 50 / 100. The
+                // 10-holder burn needs a token call, so it returns a
+                // promise chained to its callback.
                 if let Some(burn) = self.fire_milestones(coin_id) {
                     let (milestone, amount) = burn;
                     let token_id = coin_token_id(self, coin_id);
@@ -1583,10 +1831,15 @@ impl Contract {
     /// (milestone, whole tokens) when the 10-holder burn must be executed
     /// via the token contract; the 50 and 100 milestones are pure state
     /// changes applied here. At most one milestone fires per call, because
-    /// a single buy adds at most one new holder.
+    /// a single buy adds at most one new qualified holder. Milestones
+    /// count QUALIFIED holders (coin.qualified_holders), not raw wallet
+    /// count: a wallet only counts when its curve-bought position is at
+    /// least MIN_QUALIFIED_HOLDING_TOKENS tokens, so 100 empty wallets
+    /// cannot trigger the airdrop. The airdrop is split equally among
+    /// the qualified holders.
     fn fire_milestones(&mut self, coin_id: u64) -> Option<(u64, u128)> {
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
-        let holders = coin.holders.len() as u64;
+        let holders = coin.qualified_holders;
         let creator = coin.creator.clone();
         if holders >= MILESTONE_HOLDERS_1 && !coin.milestones_fired.contains(&MILESTONE_HOLDERS_1) {
             let amount = coin.total_supply_tokens * MILESTONE_BURN_BP / 10_000;
@@ -1600,7 +1853,7 @@ impl Contract {
                 coin_id,
                 amount,
                 0,
-                format!("10 holders: burned {} tokens (1% of supply)", amount),
+                format!("10 qualified holders: burned {} tokens (1% of supply)", amount),
             );
             return Some((MILESTONE_HOLDERS_1, amount));
         }
@@ -1615,7 +1868,7 @@ impl Contract {
                 MILESTONE_TRANCHE_TOKENS,
                 0,
                 format!(
-                    "50 holders: treasury tranche unlocked, curve cap +{} tokens",
+                    "50 qualified holders: treasury tranche unlocked, curve cap +{} tokens",
                     MILESTONE_TRANCHE_TOKENS
                 ),
             );
@@ -1633,7 +1886,7 @@ impl Contract {
                 MILESTONE_AIRDROP_TOKENS,
                 0,
                 format!(
-                    "100 holders: airdrop live, {} tokens per holder to claim",
+                    "100 qualified holders: airdrop live, {} tokens per holder to claim",
                     per_holder
                 ),
             );
@@ -1659,7 +1912,12 @@ impl Contract {
         }
     }
 
-    /// Claim the 100-holder airdrop share. One claim per holder.
+    /// Claim the 100-holder airdrop share. One claim per holder. The
+    /// claimer must be a QUALIFIED holder (curve-bought position at
+    /// least MIN_QUALIFIED_HOLDING_TOKENS tokens) at claim time, so a
+    /// wallet that sold down below the threshold after the milestone
+    /// fired cannot claim, and a wallet that only received tokens by
+    /// transfer cannot claim either.
     pub fn claim_airdrop(&mut self, coin_id: u64) {
         let claimer = env::predecessor_account_id();
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
@@ -1671,6 +1929,10 @@ impl Contract {
         assert!(
             coin.holders.contains(&claimer),
             "only holders claim the airdrop"
+        );
+        assert!(
+            self.holder_tokens(&claimer, coin_id) >= MIN_QUALIFIED_HOLDING_TOKENS,
+            "only qualified holders claim the airdrop"
         );
         let tokens = coin.airdrop_per_holder;
         coin.airdrop_claimed.push(claimer.clone());
@@ -2745,6 +3007,7 @@ impl Contract {
         self.agents.insert(copier.clone(), stats);
         let realised_delta = net as i128 - cost_of_sold as i128;
         self.add_season_pnl(&copier, realised_delta);
+        self.record_realised(&copier, realised_delta);
         let mut follow = self.follows.get(&key).expect("follow gone").clone();
         follow.total_sell_volume_yocto += proceeds;
         follow.fees_earned_yocto += copy_fee;
@@ -2916,6 +3179,11 @@ impl Contract {
             rep_weight_pnl: REP_W_PNL,
             rep_weight_win_rate: REP_W_WIN,
             rep_weight_hold_time: REP_W_HOLD,
+            rep_weight_trade_count: REP_W_COUNT,
+            rep_weight_drawdown: REP_W_DD,
+            volume_full_yocto: VOLUME_FULL_YOCTO.to_string(),
+            count_full: COUNT_FULL,
+            min_qualified_holding_tokens: MIN_QUALIFIED_HOLDING_TOKENS.to_string(),
             rug_window_ns: RUG_WINDOW_NS,
             hold_full_hours: HOLD_FULL_HOURS,
             milestone_holders: vec![MILESTONE_HOLDERS_1, MILESTONE_HOLDERS_2, MILESTONE_HOLDERS_3],
@@ -2987,7 +3255,7 @@ impl Contract {
     }
 
     pub fn get_score(&self, account: AccountId) -> u16 {
-        compute_score(&self.get_agent_stats(&account))
+        compute_score(&self.get_agent_stats(&account), &self.get_agent_rep(&account))
     }
 
     pub fn get_battle(&self, battle_id: u64) -> Option<BattleView> {
@@ -3395,6 +3663,12 @@ impl FungibleTokenReceiver for Contract {
         // Position / cost basis / win rate / hold time / realised PnL.
         let key = Self::position_key(&sender_id, coin_id);
         let mut pos = self.positions.get(&key).cloned().unwrap_or_default();
+        // Qualified-holder bookkeeping: a sell only ever moves a
+        // position downward, so it can only unqualify a holder, never
+        // qualify one. The cached count is decremented exactly when
+        // the position crosses the threshold downward.
+        let was_qualified = Self::is_qualified_holding(pos.bought_tokens);
+        let mut dropped_below = false;
         let mut stats = self.get_agent_stats(&sender_id);
         stats.total_received_yocto += net_proceeds;
         if pos.bought_tokens > 0 {
@@ -3410,17 +3684,25 @@ impl FungibleTokenReceiver for Contract {
             let realised_delta = net_proceeds as i128 - cost_of_sold as i128;
             pos.realised_yocto += realised_delta;
             self.add_season_pnl(&sender_id, realised_delta);
+            self.record_realised(&sender_id, realised_delta);
             pos.spent_yocto = pos.spent_yocto.saturating_sub(cost_of_sold);
             pos.bought_tokens = pos.bought_tokens.saturating_sub(whole_tokens);
             if pos.bought_tokens == 0 {
                 pos.first_buy_ns = 0;
             }
+            dropped_below = was_qualified && !Self::is_qualified_holding(pos.bought_tokens);
         } else {
             stats.sells += 1;
             pos.realised_yocto += net_proceeds as i128;
             self.add_season_pnl(&sender_id, net_proceeds as i128);
+            self.record_realised(&sender_id, net_proceeds as i128);
         }
         self.positions.insert(key, pos);
+        if dropped_below {
+            let mut coin2 = self.coins.get(&coin_id).expect("coin not found").clone();
+            coin2.qualified_holders = coin2.qualified_holders.saturating_sub(1);
+            self.coins.insert(coin_id, coin2);
+        }
         self.agents.insert(sender_id.clone(), stats);
         self.record_event(
             "sell",
@@ -3634,13 +3916,38 @@ mod tests {
     #[test]
     fn reputation_neutral_new_agent() {
         let s = AgentStats::default();
-        assert_eq!(compute_score(&s), 500);
+        assert_eq!(compute_score(&s, &AgentRep::default()), 500);
         assert_eq!(score_band(500), "building");
     }
 
     #[test]
     fn reputation_perfect_agent() {
-        // Doubled money, won every sell, held 24h+.
+        // Doubled money, won every sell, held 24h+, ten sells, no
+        // drawdown: every component reaches 1000, so the score is 1000.
+        // Ten sells matter: with only four sells the same agent scores
+        // 790 (see reputation_few_trades_cap_score).
+        let s = AgentStats {
+            total_spent_yocto: 1_000_000_000_000_000_000_000_000,
+            total_received_yocto: 2_000_000_000_000_000_000_000_000,
+            sells: 10,
+            winning_sells: 10,
+            hold_time_total_ns: 10 * 24 * 3_600_000_000_000u128,
+            hold_count: 10,
+            rugged: false,
+            coins_launched: 1,
+            battles_played: 0,
+            battles_won: 0,
+        };
+        assert_eq!(compute_score(&s, &AgentRep::default()), 1000);
+        assert_eq!(score_band(1000), "strong");
+    }
+
+    #[test]
+    fn reputation_few_trades_cap_score() {
+        // The same perfect agent with only four sells cannot reach
+        // 1000: the win / hold / count / drawdown parts are scaled
+        // toward neutral by the trade-count factor (4/10), so each is
+        // 700 and the score is 790, not 1000.
         let s = AgentStats {
             total_spent_yocto: 1_000_000_000_000_000_000_000_000,
             total_received_yocto: 2_000_000_000_000_000_000_000_000,
@@ -3653,13 +3960,91 @@ mod tests {
             battles_played: 0,
             battles_won: 0,
         };
-        assert_eq!(compute_score(&s), 1000);
-        assert_eq!(score_band(1000), "strong");
+        assert_eq!(compute_score(&s, &AgentRep::default()), 790);
+        assert_eq!(score_band(790), "solid");
+    }
+
+    #[test]
+    fn reputation_tiny_trade_farmer_cannot_score_high() {
+        // Doubled 0.001 NEAR in one 24h trade: the raw return is a
+        // perfect +100%, but only 0.001 NEAR was risked, so the PnL
+        // part is ~500 (volume factor 1/1000) and the other parts are
+        // scaled toward neutral by the single trade. Score 535:
+        // "building", nowhere near a top score.
+        let s = AgentStats {
+            total_spent_yocto: 1_000_000_000_000_000_000_000,
+            total_received_yocto: 2_000_000_000_000_000_000_000,
+            sells: 1,
+            winning_sells: 1,
+            hold_time_total_ns: 24 * 3_600_000_000_000u128,
+            hold_count: 1,
+            rugged: false,
+            coins_launched: 0,
+            battles_played: 0,
+            battles_won: 0,
+        };
+        let score = compute_score(&s, &AgentRep::default());
+        assert_eq!(score, 535);
+        assert!(score < 600, "tiny-trade farmer must stay below solid");
+        assert_eq!(score_band(score), "building");
+    }
+
+    #[test]
+    fn reputation_high_drawdown_scores_lower_than_steady() {
+        // Steady agent: +25% on 10 NEAR, 20 sells, 80% win, 24h hold,
+        // 5% max drawdown. Volatile agent: -10% on 10 NEAR, 20 sells,
+        // 50% win, 12h hold, 60% max drawdown. The volatile agent
+        // scores far lower (540 vs 837), as the drawdown part requires.
+        let steady = AgentStats {
+            total_spent_yocto: 10_000_000_000_000_000_000_000_000,
+            total_received_yocto: 12_500_000_000_000_000_000_000_000,
+            sells: 20,
+            winning_sells: 16,
+            hold_time_total_ns: 20 * 24 * 3_600_000_000_000u128,
+            hold_count: 20,
+            rugged: false,
+            coins_launched: 0,
+            battles_played: 0,
+            battles_won: 0,
+        };
+        let steady_rep = AgentRep {
+            realised_pnl_yocto: 2_500_000_000_000_000_000_000_000,
+            peak_realised_yocto: 3_000_000_000_000_000_000_000_000,
+            max_drawdown_yocto: 500_000_000_000_000_000_000_000,
+        };
+        let volatile = AgentStats {
+            total_spent_yocto: 10_000_000_000_000_000_000_000_000,
+            total_received_yocto: 9_000_000_000_000_000_000_000_000,
+            sells: 20,
+            winning_sells: 10,
+            hold_time_total_ns: 20 * 12 * 3_600_000_000_000u128,
+            hold_count: 20,
+            rugged: false,
+            coins_launched: 0,
+            battles_played: 0,
+            battles_won: 0,
+        };
+        let volatile_rep = AgentRep {
+            realised_pnl_yocto: -1_000_000_000_000_000_000_000_000,
+            peak_realised_yocto: 5_000_000_000_000_000_000_000_000,
+            max_drawdown_yocto: 6_000_000_000_000_000_000_000_000,
+        };
+        let steady_score = compute_score(&steady, &steady_rep);
+        let volatile_score = compute_score(&volatile, &volatile_rep);
+        assert_eq!(steady_score, 837);
+        assert_eq!(volatile_score, 540);
+        assert!(steady_score > volatile_score);
+        assert!(steady_score >= 800, "steady agent is strong");
+        assert!(volatile_score < 600, "high-drawdown agent stays building");
     }
 
     #[test]
     fn reputation_losing_agent() {
-        // Lost everything, no wins, instant flips.
+        // Lost everything, no wins, instant flips, full drawdown.
+        // The PnL part is 0, but the count part is 700 (four sells)
+        // and the other parts are pulled toward neutral by the
+        // trade-count factor, so the score is 270, not 0: a real
+        // trader who lost, not a non-entity.
         let s = AgentStats {
             total_spent_yocto: 1_000_000_000_000_000_000_000_000,
             total_received_yocto: 0,
@@ -3672,9 +4057,13 @@ mod tests {
             battles_played: 0,
             battles_won: 0,
         };
-        // PnL 0, win 0, hold 0 -> weighted 0.
-        assert_eq!(compute_score(&s), 0);
-        assert_eq!(score_band(0), "thin");
+        let rep = AgentRep {
+            realised_pnl_yocto: -1_000_000_000_000_000_000_000_000,
+            peak_realised_yocto: 0,
+            max_drawdown_yocto: 1_000_000_000_000_000_000_000_000,
+        };
+        assert_eq!(compute_score(&s, &rep), 270);
+        assert_eq!(score_band(270), "thin");
     }
 
     #[test]
@@ -3682,23 +4071,79 @@ mod tests {
         let mut s = AgentStats {
             total_spent_yocto: 1_000_000_000_000_000_000_000_000,
             total_received_yocto: 2_000_000_000_000_000_000_000_000,
-            sells: 4,
-            winning_sells: 4,
-            hold_time_total_ns: 4 * 24 * 3_600_000_000_000u128,
-            hold_count: 4,
+            sells: 10,
+            winning_sells: 10,
+            hold_time_total_ns: 10 * 24 * 3_600_000_000_000u128,
+            hold_count: 10,
             rugged: true,
             coins_launched: 1,
             battles_played: 0,
             battles_won: 0,
         };
-        assert_eq!(compute_score(&s), 0);
+        assert_eq!(compute_score(&s, &AgentRep::default()), 0);
         s.rugged = false;
-        assert_eq!(compute_score(&s), 1000);
+        assert_eq!(compute_score(&s, &AgentRep::default()), 1000);
     }
 
     #[test]
     fn reputation_weights_sum_to_100() {
-        assert_eq!(REP_W_PNL + REP_W_WIN + REP_W_HOLD, 100);
+        assert_eq!(REP_W_PNL + REP_W_WIN + REP_W_HOLD + REP_W_COUNT + REP_W_DD, 100);
+        assert_eq!(REP_W_PNL, 30);
+        assert_eq!(REP_W_WIN, 20);
+        assert_eq!(REP_W_HOLD, 15);
+        assert_eq!(REP_W_COUNT, 15);
+        assert_eq!(REP_W_DD, 20);
+    }
+
+    #[test]
+    fn reputation_scaling_factors() {
+        // Volume factor: 0 with no volume, half at 0.5 NEAR, full at 1 NEAR.
+        assert_eq!(volume_factor(0), 0);
+        assert_eq!(volume_factor(500_000_000_000_000_000_000_000), 500);
+        assert_eq!(volume_factor(VOLUME_FULL_YOCTO), 1000);
+        assert_eq!(volume_factor(10 * VOLUME_FULL_YOCTO), 1000);
+        // Count factor: 0 with no sells, half at 5, full at 10, capped after.
+        assert_eq!(count_factor(0), 0);
+        assert_eq!(count_factor(5), 500);
+        assert_eq!(count_factor(COUNT_FULL), 1000);
+        assert_eq!(count_factor(20), 1000);
+        // Scale toward neutral: factor 0 is neutral, factor 1000 is raw.
+        assert_eq!(scale_toward_neutral(1000, 0), 500);
+        assert_eq!(scale_toward_neutral(1000, 1000), 1000);
+        assert_eq!(scale_toward_neutral(0, 1000), 0);
+        assert_eq!(scale_toward_neutral(1000, 100), 550);
+        assert_eq!(scale_toward_neutral(0, 100), 450);
+    }
+
+    #[test]
+    fn drawdown_component_is_neutral_without_data() {
+        // No sells: neutral whatever the record says.
+        assert_eq!(drawdown_component(0, 0, 0), 500);
+        assert_eq!(drawdown_component(0, 1_000_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000_000), 500);
+        // No drawdown with enough sells: full marks.
+        assert_eq!(drawdown_component(10, 0, 1_000_000_000_000_000_000_000_000), 1000);
+        // Half the deployed volume given back: 500.
+        assert_eq!(drawdown_component(10, 500_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000_000), 500);
+        // All of it given back: 0.
+        assert_eq!(drawdown_component(10, 1_000_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000_000), 0);
+        // The same full drawdown with one sell is pulled toward neutral.
+        assert_eq!(drawdown_component(1, 1_000_000_000_000_000_000_000_000, 1_000_000_000_000_000_000_000_000), 450);
+    }
+
+    #[test]
+    fn sybil_threshold_justification() {
+        // The threshold is 10,000 tokens. Three equalities justify it:
+        // - 100 wallets at the threshold hold exactly the airdrop
+        //   (1,000,000 tokens), so farming the airdrop costs as much
+        //   capital as the airdrop pays.
+        assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS, 10_000);
+        assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS * MILESTONE_HOLDERS_3 as u128, MILESTONE_AIRDROP_TOKENS);
+        // - It equals the tokens from the minimum initial buy (0.01
+        //   NEAR) at launch price (0.000001 NEAR per token), so any
+        //   real holder who buys at least the minimum qualifies.
+        assert_eq!(MIN_INITIAL_BUY_YOCTO / CURVE_BASE_PRICE_YOCTO, MIN_QUALIFIED_HOLDING_TOKENS);
+        // - It equals 0.001% of the 1,000,000,000 total supply.
+        assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS * 100_000, TOTAL_SUPPLY_TOKENS);
     }
 
     #[test]

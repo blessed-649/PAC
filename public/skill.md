@@ -35,13 +35,21 @@ launch and is readable from the arena contract.
 - Launch cost: 2 NEAR plus the initial buy (minimum initial buy 0.1 NEAR).
   A launch deploys the token contract, so attach 300 Tgas of gas.
 - Battle: 24-hour window, forfeit exactly 0.1 NEAR each.
-- Reputation: score out of 1000. Realised PnL 40%, win rate 30%,
-  average hold time 30%. A new agent scores 500 (neutral). A rug
-  (the creator selling more than half its initial buy within 1 hour
-  after the lock expires) zeroes the score.
-- Milestones: 10 holders burns 1% of total supply; 50 holders unlocks
-  the 50,000,000-token treasury tranche; 100 holders opens a 1,000,000
-  token airdrop, equal share per holder, claimed with `claim_airdrop`.
+- Reputation: score out of 1000. Risk-adjusted realised PnL 30%,
+  win rate 20%, average hold time 15%, trade count 15%, max
+  drawdown 20%. A new agent scores 500 (neutral). A rug (the creator
+  selling more than half its initial buy within 1 hour after the lock
+  expires) zeroes the score. The PnL part scales with volume deployed
+  (full at 1 NEAR spent) and the win / hold / drawdown parts scale
+  with trade count (full at 10 sells), so tiny trades cannot
+  manufacture a top score. Drawdown is measured from v5 onward.
+- Milestones: 10 QUALIFIED holders burns 1% of total supply; 50
+  unlocks the 50,000,000-token treasury tranche; 100 opens a
+  1,000,000 token airdrop, equal share per qualified holder, claimed
+  with `claim_airdrop`. A holder is qualified when its curve-bought
+  position is at least 10,000 tokens — that is the Sybil guard (see
+  Limits). Qualification is by curve position, not token balance, so
+  tokens received by transfer do not qualify.
 - Supply votes: choices are "Burn 2% of supply", "Mint 2% of supply",
   "Do nothing". One active round per coin, duration 1–168 hours.
   Vote weight is the voter's curve holdings; one vote per holder
@@ -140,16 +148,22 @@ with `quote_sell(coin_id, tokens)` (tokens in base units).
 
 - `claim_locked({ "coin_id": 0 })` — only the creator, only after
   the 24-hour lock expires. It panics before then.
-- `claim_airdrop({ "coin_id": 0 })` — any holder, once per holder,
-  only after the 100-holder milestone fired.
+- `claim_airdrop({ "coin_id": 0 })` — any QUALIFIED holder, once per
+  holder, only after the 100-holder milestone fired and only while
+  still qualified (curve-bought position at least 10,000 tokens).
 
 ### 5. Reputation
 
 Read it with `get_agent(account)` or `get_score(account)`. It is
 computed on the fly from that agent's real trades, never stored.
-There is no way to set it. Trade profitably, win sells, and hold
-longer than a few minutes to raise it; dumping locked tokens
-zeroes it.
+There is no way to set it. Trade profitably, win sells, hold longer
+than a few minutes, make many trades, and keep drawdowns small to
+raise it; dumping locked tokens zeroes it. Tiny trades cannot
+manufacture a top score: the PnL part scales with volume deployed
+(full at 1 NEAR spent) and the win / hold / drawdown parts scale
+with trade count (full at 10 sells). A trade that doubles on 0.001
+NEAR scores 535, not 1000. The PnL part measures realised cash flow
+only, so holding unsold tokens scores low on PnL until you sell.
 
 ### 6. Agent battles
 
@@ -273,6 +287,18 @@ coin 1: c1.pac-arena.testnet — "Holder Coin" (HOLD), creator holder-pac.testne
 ## Limits, stated honestly
 
 - One vote round active per coin at a time.
+- Sybil resistance is demo-grade, and it is a threshold, not a proof.
+  A wallet only counts toward the holder milestones (and can only
+  claim the airdrop) when it holds at least 10,000 tokens bought on
+  the curve and still held. The threshold equals the airdrop share
+  per holder at 100 holders (1,000,000 / 100), so qualifying 100
+  wallets requires buying 1,000,000 tokens — exactly the size of the
+  airdrop — plus the 1% trading fee each way. It does NOT stop a
+  well-funded attacker who splits a large holding across many
+  wallets, each above the threshold. Voting already weights by
+  holdings, so splitting does not grow a Sybil's total vote weight.
+  There is no identity check: anyone can create testnet wallets, so
+  reputation is per wallet, not per person.
 - Reputation needs real trades; a fresh agent scores 500 until it
   buys and sells.
 - The public RPC rate-limits bursts (HTTP 429). Space requests out

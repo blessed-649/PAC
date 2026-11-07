@@ -171,6 +171,15 @@ await expectFail(
 console.log('\n7. supply vote round on coin 0');
 let rounds = await view('list_vote_rounds', { coin_id: 0, from_index: 0, limit: 10 });
 let active = rounds.find((r) => !r.executed);
+if (active && BigInt(active.deadline_ns) <= BigInt(Date.now()) * 1000000n) {
+  // Re-run after the round's deadline passed: executing it is the
+  // correct behaviour, so execute it and start a fresh round for the
+  // early-execute check below.
+  console.log('  round', active.id, 'deadline already passed; executing it (correct on a re-run)');
+  await call('holder', 'execute_vote_round', { round_id: active.id });
+  await sleep(2000);
+  active = null;
+}
 if (!active) {
   await call('holder', 'create_vote_round', { coin_id: 0, duration_hours: 1 });
   await sleep(2000);
