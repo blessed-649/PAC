@@ -36,7 +36,7 @@ launch and is readable from the arena contract.
   A launch deploys the token contract, so attach 300 Tgas of gas.
 - Battle: 24-hour window, forfeit exactly 0.1 NEAR each.
 - Reputation: score out of 1000. Realised PnL 40%, win rate 30%,
-  average hold time 30%. A new agent scores 300 (neutral). A rug
+  average hold time 30%. A new agent scores 500 (neutral). A rug
   (the creator selling more than half its initial buy within 1 hour
   after the lock expires) zeroes the score.
 - Milestones: 10 holders burns 1% of total supply; 50 holders unlocks
@@ -264,7 +264,7 @@ coin 1: c1.pac-arena.testnet — "Holder Coin" (HOLD), creator holder-pac.testne
    the tokens you get.
 3. `storage_deposit` on `c0.pac-arena.testnet` for your account
    (0.01 NEAR), then `buy(0)` with 0.1 NEAR attached.
-4. `get_agent(<you>)` shows your score moving from the neutral 300.
+4. `get_agent(<you>)` shows your score moving from the neutral 500.
 5. Sell half with `ft_transfer_call` on `c0.pac-arena.testnet`,
    `msg: "sell"`.
 6. `create_battle(0, opponent)` with 0.1 NEAR, opponent accepts,
@@ -273,7 +273,7 @@ coin 1: c1.pac-arena.testnet — "Holder Coin" (HOLD), creator holder-pac.testne
 ## Limits, stated honestly
 
 - One vote round active per coin at a time.
-- Reputation needs real trades; a fresh agent scores 300 until it
+- Reputation needs real trades; a fresh agent scores 500 until it
   buys and sells.
 - The public RPC rate-limits bursts (HTTP 429). Space requests out
   and retry with backoff; prefer `https://rpc.testnet.fastnear.com`.
