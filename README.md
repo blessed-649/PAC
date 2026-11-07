@@ -260,20 +260,22 @@ the only thing NEAR AI does in PAC.
   prompt is documented at the top of the judge script so the judging
   is reproducible.
 - **Verifiable.** The judging runs in a TEE with attestation. The
-  service fetches the attestation evidence for each scoring call
-  (GET `/v1/attestation/report`, trusted only when the report echoes
-  the request nonce) and stores the SHA-256 hex digest of that
-  evidence onchain next to the score, so anyone can check that a real
-  attested NEAR AI run produced it.
+  connector helper fetches the attestation evidence for each scoring
+  call (GET `/v1/attestation/report`, trusted only when the report
+  echoes the request nonce) and the judge stores the SHA-256 hex
+  digest of that evidence onchain next to the score, so anyone can
+  check that a real attested NEAR AI run produced it.
 - **Onchain, 50/50.** The AI score is stored onchain with
   `record_ai_score` (callable only by the judge account, the arena
   itself) and combines 50/50 with the community vote to pick the
   daily winner: the AI total scaled 0-100 plus the votes scaled 0-100
   against the day's max votes. The winner still earns 0.01 NEAR.
-- **The key.** The judge service reads the NEAR AI API key only from
-  the `PAC_NEAR_AI_API_KEY` environment variable and fails closed
-  without it. The key is never hardcoded, never printed and never
-  committed. Live AI scoring cannot run until that key is provided.
+- **The key.** The judge service never reads the NEAR AI API key
+  from an env var. Scoring calls go through the stored connector
+  `custom.near-ai-pac`, which calls NEAR AI Cloud with the key held
+  in the Secure Vault. If the helper is missing or a call fails, the
+  service fails closed. The key is never hardcoded, never printed
+  and never committed.
 - **What NEAR AI does NOT do.** NEAR AI does not run the arena, the
   bonding curve, the reputation score, the battles, the copy trading,
   the prize pools, or the site. Those are deterministic onchain math
@@ -310,7 +312,7 @@ node scripts/test-migration.mjs
 # v2 state survives and the v3 AI judge methods work
 node scripts/test-migration-v3.mjs
 
-# AI meme judge (needs PAC_NEAR_AI_API_KEY; fails closed without it)
+# AI meme judge (uses the stored custom.near-ai-pac connector; fails closed without it)
 node scripts/ai-meme-judge.mjs --coin 0 --day 0 --dry-run
 
 # auto copy relayer (needs scripts/copy-relayer.config.json, gitignored)

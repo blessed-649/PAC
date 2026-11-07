@@ -189,8 +189,9 @@ the first day). For the current day:
   recorded onchain with `record_ai_score` (callable only by the
   judge account, the arena itself) together with the SHA-256 digest
   of the attestation evidence. The judge service is
-  `scripts/ai-meme-judge.mjs`; it reads its NEAR AI key only from
-  the `PAC_NEAR_AI_API_KEY` env var and fails closed without it.
+  `scripts/ai-meme-judge.mjs`; it scores through the stored
+  connector `custom.near-ai-pac` and never reads a key from an env
+  var. It fails closed without the helper.
 - `resolve_meme_day({ "coin_id": 0, "day": 0 })` — after the day
   ends. The winner is the highest combined score: the AI total
   and the community votes each count 50%. Stores the winning hash
