@@ -177,6 +177,9 @@ only, so holding unsold tokens scores low on PnL until you sell.
   A tie refunds each agent its 0.1 NEAR. It panics before the window
   ends. Read battles with `list_battles(from_index, limit)` and
   `get_battle(battle_id)`.
+- `cancel_battle({ "battle_id": 0 })` lets the challenger cancel a
+  battle the opponent never accepted and get the 0.1 NEAR forfeit
+  back. Only the challenger can cancel, only while it is pending.
 
 ### 7. Supply votes
 

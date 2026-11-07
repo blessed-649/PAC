@@ -103,6 +103,14 @@ pub const BATTLE_FORFEIT_YOCTO: u128 = 100_000_000_000_000_000_000_000;
 pub const LAUNCH_COST_YOCTO: u128 = 2_000_000_000_000_000_000_000_000;
 /// Minimum initial buy at launch, yoctoNEAR (0.01 NEAR).
 pub const MIN_INITIAL_BUY_YOCTO: u128 = 10_000_000_000_000_000_000_000;
+/// Max lengths for coin name / symbol / description at launch (chars).
+/// The arena pays storage for the coin record out of its own balance,
+/// so unbounded strings would let a launcher bloat arena storage for
+/// free; the token contract's copy of the name/symbol is funded by
+/// the 2 NEAR launch cost, but the arena-side record is not.
+pub const NAME_MAX_CHARS: usize = 64;
+pub const SYMBOL_MAX_CHARS: usize = 16;
+pub const DESCRIPTION_MAX_CHARS: usize = 500;
 /// Reputation weights (must sum to 100). v5: realised PnL (risk-adjusted
 /// and volume-scaled) 30, win rate 20, hold time 15, trade count 15,
 /// max drawdown 20. A tiny trade that doubles cannot manufacture a top
@@ -982,7 +990,8 @@ fn battle_status_str(status: u8) -> &'static str {
     match status {
         0 => "pending",
         1 => "active",
-        _ => "resolved",
+        2 => "resolved",
+        _ => "cancelled",
     }
 }
 
@@ -1109,7 +1118,7 @@ pub trait ExtSelf {
     ) -> PromiseOrValue<bool>;
     fn on_claim(&mut self, coin_id: u64, creator: AccountId, tokens: U128) -> bool;
     fn on_milestone_burn(&mut self, coin_id: u64, milestone: u64, amount: U128) -> bool;
-    fn on_vote_executed(&mut self, round_id: u64, outcome: String) -> bool;
+    fn on_vote_executed(&mut self, round_id: u64, outcome: String, amount: U128) -> bool;
     fn on_airdrop_claim(&mut self, coin_id: u64, claimer: AccountId, tokens: U128) -> bool;
     fn on_withdraw_copy(
         &mut self,
@@ -1174,13 +1183,14 @@ pub struct Contract {
     agent_rep: LookupMap<AccountId, AgentRep>,
 }
 
-/// The v4 coin record, kept verbatim so migrate() can deserialise the
-/// live v4 coin bytes. Field order and types must match the v4 Coin
-/// exactly; do not edit. The v5 Coin adds qualified_holders, so the
-/// v4 bytes cannot deserialise as a v5 Coin and migrate() rebuilds
-/// each coin with its qualified holder count computed from positions.
+/// The v5 coin record, kept verbatim so migrate() can deserialise the
+/// live v5 coin bytes. Field order and types must match the v5 Coin
+/// exactly; do not edit. The v5 Coin adds qualified_holders (before
+/// image_url), so the v4 bytes cannot deserialise as a v5 Coin. The
+/// v6 Coin is identical to the v5 Coin, so migrate() copies each coin
+/// field for field, including its stored qualified holder count.
 /// BorshSerialize is derived so the LookupMap type bounds hold; its
-/// bytes are identical to the v4 Coin.
+/// bytes are identical to the v5 Coin.
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct OldCoin {
     pub id: u64,
@@ -1205,15 +1215,17 @@ pub struct OldCoin {
     pub airdrop_per_holder: u128,
     pub airdrop_claimed: Vec<AccountId>,
     pub holders: Vec<AccountId>,
+    pub qualified_holders: u64,
     pub image_url: Option<String>,
 }
 
-/// The v4 contract state, kept verbatim so migrate() can deserialise
-/// the live v4 bytes and rebuild the v5 state from them. Field order
-/// and types must match the v4 Contract exactly; do not edit. The
+/// The v5 contract state, kept verbatim so migrate() can deserialise
+/// the live v5 bytes and rebuild the v6 state from them. Field order
+/// and types must match the v5 Contract exactly; do not edit. The
 /// coins map holds OldCoin records (see above) because the v5 Coin
-/// adds qualified_holders and the v4 coin bytes cannot deserialise
-/// as v5 Coins. The v5 Contract adds agent_rep at the end.
+/// adds qualified_holders. The v5 Contract adds agent_rep at the end.
+/// The v6 Contract is identical to the v5 Contract, so migrate() is
+/// a straight copy of every field and collection.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -1237,11 +1249,14 @@ pub struct OldContract {
     seasons: LookupMap<u64, Season>,
     season_pnl: LookupMap<String, i128>,
     /// "coin_id:day:submission_index" -> the meme text the AI judge
-    /// reads (v4 field; same position as in the v4 Contract).
+    /// reads (v5 field; same position as in the v5 Contract).
     meme_texts: LookupMap<String, String>,
     /// "coin_id:day:submission_index" -> the NEAR AI judge's score
-    /// (v4 field; same position as in the v4 Contract).
+    /// (v5 field; same position as in the v5 Contract).
     ai_scores: LookupMap<String, AiScore>,
+    /// Per-agent reputation extension (v5): realised PnL, peak, max
+    /// drawdown (same position as in the v5 Contract).
+    agent_rep: LookupMap<AccountId, AgentRep>,
 }
 
 #[near]
@@ -1275,52 +1290,33 @@ impl Contract {
         }
     }
 
-    /// Migrate the live v4 state to v5 without wiping it. Deploy the
-    /// v5 WASM over the v4 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v4 field and collection
+    /// Migrate the live v5 state to v6 without wiping it. Deploy the
+    /// v6 WASM over the v5 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v5 field and collection
     /// verbatim (agents, positions, battles, vote rounds, coin duels,
     /// meme days, meme texts, AI scores, activity, prize pool, follows,
-    /// copy positions, seasons), and rebuilds each coin as a v5 Coin
-    /// with its qualified holder count computed from the holders'
-    /// curve positions (a holder qualifies when its curve-bought
-    /// position is at least MIN_QUALIFIED_HOLDING_TOKENS tokens). The
-    /// v4 coin Borsh bytes carry no qualified_holders field, so they
-    /// cannot deserialise as v5 Coins. Coin ids are sequential from 0,
-    /// so the rebuild walks 0..coin_count and skips ids with no stored
-    /// coin (a failed launch leaves a gap). The new coins map reuses
-    /// the same storage prefix, so each converted coin overwrites its
-    /// old bytes at the same key. The new agent_rep collection starts
-    /// empty: drawdown and realised PnL are measured from v5 onward
-    /// only, and pre-v5 history is not backfilled (the contract cannot
-    /// enumerate past agents to rebuild it). Calling migrate() twice
-    /// fails: after the first call the stored state is v5, which no
-    /// longer deserialises as v4.
+    /// copy positions, seasons, agent_rep), and rebuilds each coin as
+    /// a v6 Coin field for field, including its stored qualified
+    /// holder count. The v6 Coin and Contract are identical to the v5
+    /// layouts, so this is a straight copy; the only code change in v6
+    /// is the audit fixes (logic only, no state-layout change). Coin
+    /// ids are sequential from 0, so the rebuild walks 0..coin_count
+    /// and skips ids with no stored coin (a failed launch leaves a
+    /// gap). The new coins map reuses the same storage prefix, so each
+    /// converted coin overwrites its old bytes at the same key. NOTE:
+    /// set(), not insert(). insert() loads the previous value at the
+    /// key so it can return it; set() only marks the cache entry
+    /// modified, so the v6 bytes overwrite the v5 bytes at the same
+    /// key on flush. Calling migrate() twice fails: after the first
+    /// call the stored state is v6, which no longer deserialises as
+    /// v5 (the v6 code is deployed, so the second call runs the v6
+    /// migrate() against v6 state and the OldContract read fails).
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v4 state to migrate");
+        let old: OldContract = env::state_read().expect("no v5 state to migrate");
         let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
         for id in 0..old.coin_count {
             if let Some(oc) = old.coins.get(&id).cloned() {
-                // Count qualified holders from the curve positions:
-                // a holder qualifies when its bought position is at
-                // least the threshold. Positions are keyed
-                // "account:coin_id" (see position_key).
-                let mut qualified_holders = 0u64;
-                for holder in oc.holders.iter() {
-                    let key = Self::position_key(holder, id);
-                    if let Some(pos) = old.positions.get(&key) {
-                        if pos.bought_tokens >= MIN_QUALIFIED_HOLDING_TOKENS {
-                            qualified_holders += 1;
-                        }
-                    }
-                }
-                // NOTE: set(), not insert(). insert() loads the previous
-                // value at the key so it can return it, and the stored
-                // value here is still v4 coin bytes, which cannot
-                // deserialise as a v5 Coin (no qualified_holders field)
-                // and would panic with "Cannot deserialize element".
-                // set() only marks the cache entry modified, so the v5
-                // bytes overwrite the v4 bytes at the same key on flush.
                 coins.set(id, Some(Coin {
                     id: oc.id,
                     token_id: oc.token_id,
@@ -1344,7 +1340,7 @@ impl Contract {
                     airdrop_per_holder: oc.airdrop_per_holder,
                     airdrop_claimed: oc.airdrop_claimed,
                     holders: oc.holders,
-                    qualified_holders,
+                    qualified_holders: oc.qualified_holders,
                     image_url: oc.image_url,
                 }));
             }
@@ -1372,7 +1368,7 @@ impl Contract {
             season_pnl: old.season_pnl,
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
-            agent_rep: LookupMap::new(b"r"),
+            agent_rep: old.agent_rep,
         }
     }
 
@@ -1536,7 +1532,13 @@ impl Contract {
         let creator = env::predecessor_account_id();
         let attached = env::attached_deposit().as_yoctonear();
         assert!(!name.trim().is_empty(), "name required");
+        assert!(name.chars().count() <= NAME_MAX_CHARS, "name too long");
         assert!(!symbol.trim().is_empty(), "symbol required");
+        assert!(symbol.chars().count() <= SYMBOL_MAX_CHARS, "symbol too long");
+        assert!(
+            description.chars().count() <= DESCRIPTION_MAX_CHARS,
+            "description too long"
+        );
         assert!(
             symbol.chars().all(|c| c.is_ascii_alphanumeric()),
             "symbol must be alphanumeric"
@@ -1917,11 +1919,22 @@ impl Contract {
     /// least MIN_QUALIFIED_HOLDING_TOKENS tokens) at claim time, so a
     /// wallet that sold down below the threshold after the milestone
     /// fired cannot claim, and a wallet that only received tokens by
-    /// transfer cannot claim either.
+    /// transfer cannot claim either. The total paid out is capped at
+    /// the 1,000,000-token airdrop: the per-holder share was fixed
+    /// when the milestone fired (1,000,000 / qualified holders at
+    /// that moment), so the number of claims can never exceed that
+    /// count — without this cap, wallets that qualify after the
+    /// milestone fires could each claim the same share and drain
+    /// the arena reserve far beyond the intended 1,000,000 tokens.
     pub fn claim_airdrop(&mut self, coin_id: u64) {
         let claimer = env::predecessor_account_id();
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
         assert!(coin.airdrop_per_holder > 0, "no airdrop live");
+        assert!(
+            (coin.airdrop_claimed.len() as u128)
+                < MILESTONE_AIRDROP_TOKENS / coin.airdrop_per_holder,
+            "airdrop fully claimed"
+        );
         assert!(
             !coin.airdrop_claimed.contains(&claimer),
             "already claimed"
@@ -2095,6 +2108,31 @@ impl Contract {
             0,
             BATTLE_FORFEIT_YOCTO,
             format!("battle {} accepted, 24h window started", battle_id),
+        );
+    }
+
+    /// Cancel a pending battle the opponent never accepted. Only the
+    /// challenger can cancel, only while the battle is still pending.
+    /// Without this, a challenger whose opponent never accepts loses
+    /// the 0.1 NEAR forfeit forever — there was no way to get it back.
+    /// The forfeit is refunded and the battle is marked cancelled;
+    /// it can no longer be accepted or resolved.
+    pub fn cancel_battle(&mut self, battle_id: u64) {
+        let caller = env::predecessor_account_id();
+        let mut battle = self.battles.get(&battle_id).expect("battle not found").clone();
+        assert_eq!(battle.status, 0, "battle not pending");
+        assert_eq!(caller, battle.agent_a, "only the challenger cancels");
+        battle.status = 3;
+        self.battles.insert(battle_id, battle.clone());
+        Promise::new(battle.agent_a.clone())
+            .transfer(NearToken::from_yoctonear(battle.forfeit_yocto));
+        self.record_event(
+            "battle_cancelled",
+            caller,
+            battle.coin_id,
+            0,
+            battle.forfeit_yocto,
+            format!("battle {} cancelled, forfeit refunded", battle_id),
         );
     }
 
@@ -2389,7 +2427,7 @@ impl Contract {
                 .then(
                     ext_self::ext(env::current_account_id())
                         .with_static_gas(Gas::from_tgas(20))
-                        .on_vote_executed(round_id, outcome),
+                        .on_vote_executed(round_id, outcome, U128(amount)),
                 );
         } else if outcome == "Mint 2% of supply" {
             let amount = coin.total_supply_tokens * VOTE_MINT_BP / 10_000;
@@ -2402,7 +2440,7 @@ impl Contract {
                 .then(
                     ext_self::ext(env::current_account_id())
                         .with_static_gas(Gas::from_tgas(20))
-                        .on_vote_executed(round_id, outcome),
+                        .on_vote_executed(round_id, outcome, U128(amount)),
                 );
         } else {
             round.executed = true;
@@ -2421,8 +2459,14 @@ impl Contract {
 
     /// Callback after a vote burn/mint. Marks the round executed; on
     /// failure the accounting is reverted and the outcome notes it.
+    /// `amount` is the exact burn/mint amount executed in
+    /// execute_vote_round: it must be passed through, not recomputed
+    /// here, because the total supply has already been adjusted by
+    /// that amount — recomputing from the adjusted supply would
+    /// restore the wrong number (off by amount / 50) and permanently
+    /// corrupt the recorded supply.
     #[private]
-    pub fn on_vote_executed(&mut self, round_id: u64, outcome: String) -> bool {
+    pub fn on_vote_executed(&mut self, round_id: u64, outcome: String, amount: U128) -> bool {
         let mut round = self.vote_rounds.get(&round_id).expect("round not found").clone();
         match env::promise_result(0) {
             PromiseResult::Successful(_) => {
@@ -2443,14 +2487,16 @@ impl Contract {
             _ => {
                 let mut coin = self.coins.get(&round.coin_id).expect("coin not found").clone();
                 if outcome == "Burn 2% of supply" {
-                    let amount = coin.total_supply_tokens * VOTE_BURN_BP / 10_000;
-                    // The burn failed, so the supply did not actually fall;
-                    // undo the optimistic accounting using the pre-burn base.
-                    coin.total_supply_tokens += amount;
-                    coin.burned_tokens = coin.burned_tokens.saturating_sub(amount);
+                    // The burn failed, so the supply did not actually
+                    // fall; undo the optimistic accounting with the
+                    // exact amount that was subtracted.
+                    coin.total_supply_tokens += amount.0;
+                    coin.burned_tokens = coin.burned_tokens.saturating_sub(amount.0);
                 } else if outcome == "Mint 2% of supply" {
-                    let amount = coin.total_supply_tokens * VOTE_MINT_BP / 10_000;
-                    coin.total_supply_tokens = coin.total_supply_tokens.saturating_sub(amount);
+                    // The mint failed, so the supply did not actually
+                    // rise; undo the optimistic accounting with the
+                    // exact amount that was added.
+                    coin.total_supply_tokens = coin.total_supply_tokens.saturating_sub(amount.0);
                 }
                 self.coins.insert(round.coin_id, coin);
                 round.executed = true;
@@ -3661,6 +3707,15 @@ impl FungibleTokenReceiver for Contract {
         self.coins.insert(coin_id, coin.clone());
 
         // Position / cost basis / win rate / hold time / realised PnL.
+        // Only a sale of tokens bought on the curve has a cost basis.
+        // Tokens the seller did NOT buy on the curve (received by plain
+        // transfer, claimed from an airdrop, or withdrawn from a copy
+        // vault) have no curve position, so their sale has no realised
+        // profit to score: crediting the full proceeds as profit would
+        // let free tokens farm the season prize pool and inflate the
+        // reputation PnL with zero capital at risk. Such a sale still
+        // pays out (the swap itself is honest), but it updates no
+        // agent stats at all.
         let key = Self::position_key(&sender_id, coin_id);
         let mut pos = self.positions.get(&key).cloned().unwrap_or_default();
         // Qualified-holder bookkeeping: a sell only ever moves a
@@ -3670,8 +3725,8 @@ impl FungibleTokenReceiver for Contract {
         let was_qualified = Self::is_qualified_holding(pos.bought_tokens);
         let mut dropped_below = false;
         let mut stats = self.get_agent_stats(&sender_id);
-        stats.total_received_yocto += net_proceeds;
         if pos.bought_tokens > 0 {
+            stats.total_received_yocto += net_proceeds;
             let avg_cost = pos.spent_yocto / pos.bought_tokens;
             let cost_of_sold = whole_tokens * avg_cost;
             stats.sells += 1;
@@ -3691,12 +3746,8 @@ impl FungibleTokenReceiver for Contract {
                 pos.first_buy_ns = 0;
             }
             dropped_below = was_qualified && !Self::is_qualified_holding(pos.bought_tokens);
-        } else {
-            stats.sells += 1;
-            pos.realised_yocto += net_proceeds as i128;
-            self.add_season_pnl(&sender_id, net_proceeds as i128);
-            self.record_realised(&sender_id, net_proceeds as i128);
         }
+        // else: no curve position, so no stats update (see above).
         self.positions.insert(key, pos);
         if dropped_below {
             let mut coin2 = self.coins.get(&coin_id).expect("coin not found").clone();
@@ -4240,6 +4291,347 @@ mod tests {
         let at_limit = format!("https://example.com/{}", "a".repeat(500 - 20));
         assert_eq!(at_limit.len(), 500);
         assert!(image_url_valid(&Some(at_limit)));
+    }
+
+    // ------------------------------------------------------------------
+    // Audit fixes (v6): each test reproduces a confirmed vulnerability
+    // and proves the exploit fails after the fix.
+    // ------------------------------------------------------------------
+
+    use near_sdk::test_utils::{testing_env_with_promise_results, VMContextBuilder};
+    use near_sdk::testing_env;
+
+    fn audit_ctx(predecessor: &str, attached_yocto: u128) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id(predecessor.parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(attached_yocto))
+            .block_timestamp(1_000_000_000_000_000_000);
+        b
+    }
+
+    fn audit_coin(token_id: AccountId, creator: AccountId) -> Coin {
+        Coin {
+            id: 0,
+            token_id,
+            name: "Audit".to_string(),
+            symbol: "AUD".to_string(),
+            description: String::new(),
+            creator,
+            created_at_ns: 0,
+            sold_tokens: 1_000_000,
+            locked_tokens: 0,
+            initial_buy_tokens: 0,
+            unlock_at_ns: 0,
+            creator_sold_after_unlock: 0,
+            near_reserve_yocto: 10_000_000_000_000_000_000_000_000,
+            total_spent_yocto: 1_000_000_000_000_000_000_000_000,
+            total_received_yocto: 0,
+            total_supply_tokens: TOTAL_SUPPLY_TOKENS,
+            curve_cap_tokens: MAX_CURVE_TOKENS,
+            burned_tokens: 0,
+            milestones_fired: vec![],
+            airdrop_per_holder: 0,
+            airdrop_claimed: vec![],
+            holders: vec![],
+            qualified_holders: 0,
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn audit_no_position_sell_credits_no_stats() {
+        // HIGH: a seller with no curve position (tokens received by
+        // plain transfer, airdrop, or copy withdrawal) used to have
+        // the FULL sale proceeds credited as realised profit and
+        // season PnL — free tokens farming the prize pool with zero
+        // capital at risk. After the fix the swap still pays out,
+        // but no agent stats move at all.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id.clone(), creator));
+        c.token_to_coin.insert(token_id.clone(), 0);
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let seller: AccountId = "attacker.testnet".parse().unwrap();
+        // 10,000 tokens sold by an account that never bought on the curve.
+        let _ = c.ft_on_transfer(seller.clone(), U128(10_000 * DECIMAL_MULT), "sell".to_string());
+        let stats = c.get_agent_stats(&seller);
+        assert_eq!(stats.total_received_yocto, 0, "no-position sell must not credit received");
+        assert_eq!(stats.sells, 0, "no-position sell must not count as a trade");
+        assert_eq!(stats.winning_sells, 0);
+        assert_eq!(c.get_agent_rep(&seller).realised_pnl_yocto, 0, "no realised PnL from free tokens");
+        let season_id = c.current_season_id();
+        assert!(
+            c.season_pnl.get(&Contract::season_pnl_key(season_id, &seller)).is_none(),
+            "no season PnL from free tokens"
+        );
+        // The swap itself still executed: the curve sold count and
+        // reserve moved, so the seller was paid.
+        let coin_after = c.coins.get(&0).unwrap();
+        assert!(coin_after.sold_tokens < 1_000_000);
+        assert!(coin_after.near_reserve_yocto < 10_000_000_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn audit_position_sell_still_credits_stats() {
+        // The fix must not break honest sells: a seller WITH a curve
+        // position still gets realised PnL, season PnL, and a sell counted.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id.clone(), creator));
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let seller: AccountId = "trader.testnet".parse().unwrap();
+        // A real curve position: bought 10,000 tokens for 0.01 NEAR.
+        c.positions.insert(
+            Contract::position_key(&seller, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let _ = c.ft_on_transfer(seller.clone(), U128(10_000 * DECIMAL_MULT), "sell".to_string());
+        let stats = c.get_agent_stats(&seller);
+        assert_eq!(stats.sells, 1, "honest sell still counts");
+        assert!(stats.total_received_yocto > 0, "honest sell still credits received");
+        let season_id = c.current_season_id();
+        assert!(
+            c.season_pnl.get(&Contract::season_pnl_key(season_id, &seller)).is_some(),
+            "honest sell still records season PnL"
+        );
+    }
+
+    #[test]
+    fn audit_airdrop_claims_capped_at_fire_time_count() {
+        // MEDIUM: the airdrop share was fixed at fire time (1,000,000 /
+        // qualified holders then), but anyone qualifying later could
+        // claim the same share, so the total paid could exceed
+        // 1,000,000 and drain the reserve. After the fix the number of
+        // claims is capped at the fire-time count.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        coin.airdrop_per_holder = 10_000; // fired at 100 holders
+        coin.airdrop_claimed = (0..100)
+            .map(|i| format!("holder{}.testnet", i).parse().unwrap())
+            .collect();
+        coin.holders = coin.airdrop_claimed.clone();
+        coin.qualified_holders = 100;
+        c.coins.insert(0, coin);
+        // A 101st qualified holder, never claimed, tries to claim.
+        let late: AccountId = "late.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&late, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        let mut coin2 = c.coins.get(&0).unwrap().clone();
+        coin2.holders.push(late.clone());
+        c.coins.insert(0, coin2);
+        testing_env!(audit_ctx("late.testnet", 0).build());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.claim_airdrop(0);
+        }));
+        assert!(caught.is_err(), "101st airdrop claim must be rejected");
+        assert_eq!(c.coins.get(&0).unwrap().airdrop_claimed.len(), 100);
+    }
+
+    #[test]
+    fn audit_airdrop_cap_allows_fire_time_claims() {
+        // The cap must not block legitimate claims: with 99 of 100
+        // shares claimed, the 100th qualified holder can still claim.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        coin.airdrop_per_holder = 10_000;
+        coin.airdrop_claimed = (0..99)
+            .map(|i| format!("holder{}.testnet", i).parse().unwrap())
+            .collect();
+        coin.holders = coin.airdrop_claimed.clone();
+        coin.qualified_holders = 100;
+        c.coins.insert(0, coin);
+        let last: AccountId = "last.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&last, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        let mut coin2 = c.coins.get(&0).unwrap().clone();
+        coin2.holders.push(last.clone());
+        c.coins.insert(0, coin2);
+        testing_env!(audit_ctx("last.testnet", 0).build());
+        c.claim_airdrop(0);
+        assert_eq!(c.coins.get(&0).unwrap().airdrop_claimed.len(), 100);
+    }
+
+    #[test]
+    fn audit_vote_burn_failure_restores_exact_supply() {
+        // MEDIUM: on_vote_executed used to recompute the burn amount
+        // from the ALREADY-adjusted supply, so a failed token burn
+        // left the recorded supply short by amount/50. After the fix
+        // the exact executed amount is passed through and restored.
+        let mut c = Contract::new();
+        let supply = TOTAL_SUPPLY_TOKENS;
+        let burn = supply * VOTE_BURN_BP / 10_000; // 20,000,000
+        // Coin as it stands right after execute_vote_round subtracted
+        // the burn optimistically (the token burn then failed).
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator.clone());
+        coin.total_supply_tokens = supply - burn;
+        coin.burned_tokens = burn;
+        c.coins.insert(0, coin);
+        c.vote_rounds.insert(
+            0,
+            VoteRound {
+                id: 0,
+                coin_id: 0,
+                creator,
+                question: "How should the supply change?".to_string(),
+                choices: VOTE_CHOICES.iter().map(|s| s.to_string()).collect(),
+                deadline_ns: 0,
+                votes: vec![100, 0, 0],
+                voters: vec![],
+                executed: false,
+                outcome: None,
+            },
+        );
+        let ctx = audit_ctx("pac-arena.testnet", 0).build();
+        testing_env_with_promise_results(ctx, PromiseResult::Failed);
+        let ok = c.on_vote_executed(0, "Burn 2% of supply".to_string(), U128(burn));
+        assert!(!ok, "failed burn must report false");
+        let after = c.coins.get(&0).unwrap();
+        assert_eq!(after.total_supply_tokens, supply, "supply must be restored exactly");
+        assert_eq!(after.burned_tokens, 0, "burned count must be restored to zero");
+        // The old buggy recomputation would have restored only
+        // supply - burn/50; assert we did not land there.
+        assert_ne!(after.total_supply_tokens, supply - burn / 50);
+    }
+
+    #[test]
+    fn audit_vote_mint_failure_restores_exact_supply() {
+        // Same failure-path bug on the mint side: the old code
+        // recomputed from the already-grown supply and left it short
+        // by amount/50. The passed-through amount restores it exactly.
+        let mut c = Contract::new();
+        let supply = TOTAL_SUPPLY_TOKENS;
+        let mint = supply * VOTE_MINT_BP / 10_000; // 20,000,000
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator.clone());
+        coin.total_supply_tokens = supply + mint;
+        c.coins.insert(0, coin);
+        c.vote_rounds.insert(
+            0,
+            VoteRound {
+                id: 0,
+                coin_id: 0,
+                creator,
+                question: "How should the supply change?".to_string(),
+                choices: VOTE_CHOICES.iter().map(|s| s.to_string()).collect(),
+                deadline_ns: 0,
+                votes: vec![0, 100, 0],
+                voters: vec![],
+                executed: false,
+                outcome: None,
+            },
+        );
+        let ctx = audit_ctx("pac-arena.testnet", 0).build();
+        testing_env_with_promise_results(ctx, PromiseResult::Failed);
+        let ok = c.on_vote_executed(0, "Mint 2% of supply".to_string(), U128(mint));
+        assert!(!ok, "failed mint must report false");
+        let after = c.coins.get(&0).unwrap();
+        assert_eq!(after.total_supply_tokens, supply, "supply must be restored exactly");
+        assert_ne!(after.total_supply_tokens, supply - mint / 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "name too long")]
+    fn audit_launch_rejects_long_name() {
+        // LOW: launch took unbounded name/description/symbol strings
+        // and stored them in the arena-paid coin record. The new
+        // limits (name 64, symbol 16, description 500 chars) reject
+        // storage-bloating launches.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 3_000_000_000_000_000_000_000_000).build());
+        c.launch_coin(
+            "a".repeat(NAME_MAX_CHARS + 1),
+            "TEST".to_string(),
+            String::new(),
+            U128(MIN_INITIAL_BUY_YOCTO),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "description too long")]
+    fn audit_launch_rejects_long_description() {
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 3_000_000_000_000_000_000_000_000).build());
+        c.launch_coin(
+            "Test".to_string(),
+            "TEST".to_string(),
+            "a".repeat(DESCRIPTION_MAX_CHARS + 1),
+            U128(MIN_INITIAL_BUY_YOCTO),
+            None,
+        );
+    }
+
+    #[test]
+    fn audit_launch_length_limits_are_sane() {
+        assert_eq!(NAME_MAX_CHARS, 64);
+        assert_eq!(SYMBOL_MAX_CHARS, 16);
+        assert_eq!(DESCRIPTION_MAX_CHARS, 500);
+    }
+
+    #[test]
+    fn audit_pending_battle_can_be_cancelled() {
+        // LOW: a challenger whose opponent never accepted had no way
+        // to recover the 0.1 NEAR forfeit. cancel_battle refunds it
+        // and marks the battle cancelled so it cannot be accepted or
+        // resolved afterwards.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx("alice.testnet", BATTLE_FORFEIT_YOCTO).build());
+        let id = c.create_battle(0, opponent);
+        assert_eq!(id, 0);
+        assert_eq!(c.battles.get(&0).unwrap().status, 0);
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.cancel_battle(0);
+        assert_eq!(c.battles.get(&0).unwrap().status, 3);
+        assert_eq!(c.get_battle(0).unwrap().status, "cancelled");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the challenger cancels")]
+    fn audit_battle_cancel_rejects_non_challenger() {
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx("alice.testnet", BATTLE_FORFEIT_YOCTO).build());
+        c.create_battle(0, opponent);
+        // The challenged opponent (or anyone else) cannot cancel.
+        testing_env!(audit_ctx("bob.testnet", 0).build());
+        c.cancel_battle(0);
     }
 
 }
