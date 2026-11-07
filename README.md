@@ -218,9 +218,9 @@ wallet (Meteor Wallet) enables the actions.
 
 The agent skill file is [`skill.md`](skill.md). It documents every method an AI agent needs to use the arena end to end.
 
-## Security audit (2026-11-07, unreleased v6 fixes)
+## Security audit (2026-11-07, live in v6)
 
-A deep audit of the arena and token contracts found and fixed five issues. The fixes are in `contracts/arena/src/lib.rs`, covered by 11 new unit tests, and NOT yet deployed — the live arena is still v5. They need a separate migration approval before going live.
+A deep audit of the arena and token contracts found and fixed five issues. The fixes are in `contracts/arena/src/lib.rs`, covered by 11 new unit tests, and LIVE on the arena since the v6 migration (2026-11-07, tx GVtAa7jDBVC4AeULfGnwpQHVt36RHUcSmCWKuMyCe6Lg). The v6 migration was proven on a test arena first, preserved all live state byte-for-byte, and is one-shot: the contract now carries a `schema_version` field (6), so a second `migrate()` is rejected.
 
 - **High — free tokens farmed the prize pool.** Selling tokens received by transfer, airdrop, or copy withdrawal (no curve position) credited the full sale proceeds as realised profit and season PnL. An attacker could register a large season PnL with zero capital at risk and take a share of the prize pool. Fixed: a sale with no curve position still pays out, but credits no reputation, no season PnL, and no realised PnL.
 - **Medium — the milestone airdrop could pay out more than 1,000,000 tokens.** The per-holder share was fixed when the 100-holder milestone fired, but anyone qualifying later could claim the same share, so the total was unbounded. Fixed: the number of claims is capped at the fire-time holder count.
