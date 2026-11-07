@@ -6,10 +6,42 @@ and earn an onchain reputation score from their real trades. There is no
 admin key: every parameter was fixed at launch and is readable from the
 arena contract.
 
-Built for the NEAR "Build Beyond Boundaries" hackathon, track
-**Memecoins With Mechanics** ("the joke needs rules"). Deadline
+Built for the NEAR "Build Beyond Boundaries" hackathon. Deadline
 14 Nov 2026 23:59 UTC. Testnet only — nothing here is on mainnet
 and nothing here is real money.
+
+## Why this fits Memecoins With Mechanics
+
+Track: **Memecoins With Mechanics [11 / MEM]** (primary), **Agent Economy** (second).
+The track judges the mechanic, not the chart: "The joke needs rules."
+
+PAC answers that directly. The memecoin is the joke; the arena is the
+rules. Every coin runs on the same fixed rules, and every rule is
+enforced onchain, not promised in a whitepaper:
+
+- **Bonding curve** — stepped linear price, fixed at launch, so the price follows the rules.
+- **Creator lock** — 24 hours, immutable, so the creator cannot dump on day one.
+- **Reputation** — a score out of 1000 from real trades (realised PnL 40%, win rate 30%, hold time 30%); a rug zeroes it.
+- **Holder milestones** — 10 holders burn 1% of supply, 50 grow the curve, 100 open a 1,000,000 token airdrop.
+- **Supply votes** — holders vote to burn 2%, mint 2%, or do nothing; the winner executes onchain.
+- **Coin duels** — two coins duel 24 hours on volume; the loser pays 5% of its treasury.
+- **Agent battles** — two wallets stake 0.1 NEAR; the higher realised PnL takes both.
+- **Daily meme ritual** — holders submit a meme and vote; an AI judge scores it (see below).
+- **Auto copy** — follow a leader; a relayer copies its trades within your limits, 1% fee to the leader.
+- **Weekly seasons** — a 1% trading fee feeds a prize pool; the top 3 weekly PnL split it 50 / 30 / 20.
+
+The chart follows the rules. The rules do not follow the chart.
+
+## What NEAR AI does in PAC: the meme judge
+
+NEAR AI Cloud runs the meme judge for the daily meme ritual. That is
+the only thing NEAR AI does in PAC.
+
+- **The judge.** For each day, the judge service (`scripts/ai-meme-judge.mjs`) fetches the day's meme submissions from the arena and sends each meme's text to NEAR AI Cloud (model `z-ai/glm-5.3-flash`) with a fixed prompt that asks for three scores, each 0 to 100: humor, originality and relevance. The exact prompt is documented at the top of the judge script so the judging is reproducible.
+- **Verifiable.** The judging runs in a TEE with attestation. The judge fetches the attestation evidence for each scoring call (trusted only when the report echoes the request nonce) and stores the SHA-256 hex digest of that evidence onchain next to the score, so anyone can check that a real attested NEAR AI run produced it.
+- **Onchain, 50/50.** The AI score is stored onchain with `record_ai_score` (callable only by the judge account, the arena itself) and combines 50/50 with the community vote to pick the daily winner: the AI total scaled 0 to 100 plus the votes scaled 0 to 100 against the day's max votes. The winner still earns 0.01 NEAR.
+- **The key.** Scoring calls go through the stored connector `custom.near-ai-pac`, which calls NEAR AI Cloud with the key held in the Secure Vault. The judge never reads the key from an env var, and the key is never hardcoded, never printed and never committed. If the helper is missing or a call fails, the service fails closed.
+- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI only judges memes, and even there the community vote still counts for half.
 
 ## Live deployment (NEAR testnet)
 
@@ -99,17 +131,6 @@ Parameters are fixed at launch; read them live with `get_params`.
 ### Graduation
 
 - A coin graduates when 793,100,000 whole tokens have sold on the curve, of the 800,000,000 the curve can sell (the bot.fun graduation level). Graduation is a display rule on this site only; the contract has no graduation constant. A graduated coin shows a Graduated badge.
-
-## What NEAR AI does in PAC
-
-NEAR AI Cloud runs the meme judge for the daily meme ritual. That is
-the only thing NEAR AI does in PAC.
-
-- **The judge.** For each day, the judge service (`scripts/ai-meme-judge.mjs`) fetches the day's meme submissions from the arena and sends each meme's text to NEAR AI Cloud (model `z-ai/glm-5.3-flash`) with a fixed prompt that asks for three scores, each 0 to 100: humor, originality and relevance. The exact prompt is documented at the top of the judge script so the judging is reproducible.
-- **Verifiable.** The judging runs in a TEE with attestation. The judge fetches the attestation evidence for each scoring call (trusted only when the report echoes the request nonce) and stores the SHA-256 hex digest of that evidence onchain next to the score, so anyone can check that a real attested NEAR AI run produced it.
-- **Onchain, 50/50.** The AI score is stored onchain with `record_ai_score` (callable only by the judge account, the arena itself) and combines 50/50 with the community vote to pick the daily winner: the AI total scaled 0 to 100 plus the votes scaled 0 to 100 against the day's max votes. The winner still earns 0.01 NEAR.
-- **The key.** Scoring calls go through the stored connector `custom.near-ai-pac`, which calls NEAR AI Cloud with the key held in the Secure Vault. The judge never reads the key from an env var, and the key is never hardcoded, never printed and never committed. If the helper is missing or a call fails, the service fails closed.
-- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the bonding curve, the reputation score, the battles, the copy trading, the prize pools, or the site. Those are deterministic onchain math and a plain frontend. The AI only judges memes, and even there the community vote still counts for half.
 
 ## How to run the checks
 
