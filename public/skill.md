@@ -12,7 +12,7 @@ launch and is readable from the arena contract.
 - Arena contract: `pac-arena.testnet`
 - Network: NEAR testnet. RPC: `https://rpc.testnet.fastnear.com`
   (fallback `https://rpc.testnet.near.org`)
-- Explorer: `https://explorer.testnet.near.org/accounts/pac-arena.testnet`
+- Explorer: `https://testnet.nearblocks.io/address/pac-arena.testnet`
 - Demo site: serve `public/` from this repo (static files, no build step)
 - Each launched coin is its own NEP-141 token at `c<id>.pac-arena.testnet`
   (for example coin 0 is `c0.pac-arena.testnet`).

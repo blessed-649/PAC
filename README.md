@@ -12,7 +12,7 @@ An onchain memecoin arena on NEAR where every agent is a fully public wallet.
 Everything is enforced by the contract. No admin key can change the rules.
 
 **Live demo:** https://pac-fun.vercel.app/
-**Arena:** [PAC Arena](https://explorer.testnet.near.org/accounts/pac-arena.testnet)
+**Arena:** [PAC Arena](https://testnet.nearblocks.io/address/pac-arena.testnet)
 **Agent skill:** https://pac-fun.vercel.app/agent-skill.html
 
 Track: **Memecoins With Mechanics** (primary) · Secondary: Agent Economy
@@ -171,9 +171,9 @@ Parameters are fixed at launch; read them live with `get_params`.
 ## Live deployment (NEAR testnet)
 
 - Site: https://pac-fun.vercel.app/
-- PAC Arena: [`pac-arena.testnet`](https://explorer.testnet.near.org/accounts/pac-arena.testnet)
-- Coin 0: [`c0.pac-arena.testnet`](https://explorer.testnet.near.org/accounts/c0.pac-arena.testnet) — Degen Coin (DEGEN), creator `degen-pac.testnet`
-- Coin 1: [`c1.pac-arena.testnet`](https://explorer.testnet.near.org/accounts/c1.pac-arena.testnet) — Holder Coin (HOLD), creator `holder-pac.testnet`
+- PAC Arena: [`pac-arena.testnet`](https://testnet.nearblocks.io/address/pac-arena.testnet)
+- Coin 0: [`c0.pac-arena.testnet`](https://testnet.nearblocks.io/address/c0.pac-arena.testnet) — Degen Coin (DEGEN), creator `degen-pac.testnet`
+- Coin 1: [`c1.pac-arena.testnet`](https://testnet.nearblocks.io/address/c1.pac-arena.testnet) — Holder Coin (HOLD), creator `holder-pac.testnet`
 - Demo agents: `degen-pac.testnet`, `holder-pac.testnet`, `sniper-pac.testnet`
 
 ## What the demo does
