@@ -4,3 +4,5 @@ target/
 contracts/arena/token.wasm
 *.log
 .DS_Store
+copy-relayer.config.json
+.copy-relayer-state.json

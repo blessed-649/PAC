@@ -24,9 +24,21 @@
 //!   8. Daily meme ritual — each 24h day holders submit a meme hash and
 //!      vote (one vote each); the winning hash is stored onchain and its
 //!      submitter earns 0.01 NEAR from the coin treasury when it affords it.
+//!   9. Auto copy — a copier follows a leader with a fixed amount per
+//!      trade and a max total. Copied tokens are held in the arena vault
+//!      (the copier's copy key can only call the arena, so a direct sell
+//!      from the copier's wallet is impossible); the copier sells or
+//!      withdraws them with copy_sell / withdraw_copy. Each copy trade
+//!      pays 1% of its amount to the leader.
+//!  10. Weekly seasons — every trade pays a 1% trading fee into the
+//!      weekly prize pool. A season is 7 days, Monday 00:00 UTC to the
+//!      next Monday. At season end anyone can call resolve_season: the
+//!      top 3 agents by that season's realised PnL split the pool
+//!      50% / 30% / 20%; any undistributed share rolls into the next
+//!      season's pool.
 //!
-//! Cut for v1 (roadmap, not built): copytrading, weekly seasons,
-//! simulation. The rnear-sdk treasury yield stays v2, not built.
+//! Cut for v1 (roadmap, not built): simulation. The rnear-sdk treasury
+//! yield stays v2, not built. Copy and weekly seasons shipped in v2.
 
 use near_contract_standards::fungible_token::metadata::FungibleTokenMetadata;
 use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
@@ -113,6 +125,33 @@ pub const MEME_DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 pub const MEME_REWARD_YOCTO: u128 = 10_000_000_000_000_000_000_000;
 /// The treasury must hold at least this much NEAR for the reward to pay.
 pub const MEME_MIN_RESERVE_YOCTO: u128 = 50_000_000_000_000_000_000_000;
+
+// ---------------------------------------------------------------------------
+// v2 parameters: auto copy and weekly seasons. Fixed at v2 launch,
+// readable by anyone, no admin key.
+// ---------------------------------------------------------------------------
+
+/// Trading fee on every buy and sell, basis points (100 = 1%). The fee
+/// goes to the weekly prize pool; it is taken from the amount that would
+/// otherwise enter the coin's NEAR reserve, so the buyer gets the same
+/// tokens for the same curve cost.
+pub const TRADING_FEE_BP: u128 = 100;
+/// Copy fee on every copy trade, basis points (100 = 1%), paid to the
+/// leader. Taken from the copy amount: a 1 NEAR copy buys 0.99 NEAR of
+/// tokens and 0.01 NEAR goes to the leader.
+pub const COPY_FEE_BP: u128 = 100;
+/// Copy per-trade amount, yoctoNEAR: min 0.01 NEAR, max 10 NEAR.
+pub const COPY_MIN_PER_TRADE_YOCTO: u128 = 10_000_000_000_000_000_000_000;
+pub const COPY_MAX_PER_TRADE_YOCTO: u128 = 10_000_000_000_000_000_000_000_000;
+/// Copy max total, yoctoNEAR: min 0.1 NEAR.
+pub const COPY_MIN_MAX_TOTAL_YOCTO: u128 = 100_000_000_000_000_000_000_000;
+/// Season length, nanoseconds (7 days, Monday 00:00 UTC to next Monday).
+pub const SEASON_DURATION_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
+/// Monday 1970-01-05 00:00 UTC in nanoseconds: the season grid anchor.
+/// Season id N covers [anchor + N * 7d, anchor + (N + 1) * 7d).
+pub const SEASON_ANCHOR_NS: u64 = 4 * 24 * 60 * 60 * 1_000_000_000;
+/// Prize pool split for the top 3 agents of a season, basis points.
+pub const SEASON_TOP_SHARES_BP: [u128; 3] = [5000, 3000, 2000];
 
 const TOKEN_WASM: &[u8] = include_bytes!("../token.wasm");
 
@@ -291,6 +330,62 @@ pub struct MemeDay {
 }
 
 // ---------------------------------------------------------------------------
+// v2 stored data: auto copy and weekly seasons
+// ---------------------------------------------------------------------------
+
+/// One copier's follow of one leader. Copied tokens are held in the
+/// arena vault (see CopyPosition): the copier's copy key can only call
+/// the arena, so copied tokens never sit in the copier's own wallet
+/// until withdrawn with withdraw_copy.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct Follow {
+    pub copier: AccountId,
+    pub leader: AccountId,
+    pub amount_per_trade_yocto: u128,
+    pub max_total_yocto: u128,
+    /// Cumulative NEAR spent on copy buys (the cap is enforced on this).
+    pub total_copied_yocto: u128,
+    /// Cumulative gross NEAR proceeds of copy sells (stats only).
+    pub total_sell_volume_yocto: u128,
+    /// Cumulative copy fees paid to the leader on this follow.
+    pub fees_earned_yocto: u128,
+    /// The copier's copy public key (informational; the key itself is
+    /// created and held by the copier, never by the contract).
+    pub copy_public_key: String,
+}
+
+/// Vaulted copied tokens: bought by copy_buy, sold by copy_sell,
+/// withdrawable with withdraw_copy. Cost basis is curve cost plus the
+/// copy fee paid on the buys, so realised PnL on a copy sell nets
+/// both fees out.
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct CopyPosition {
+    pub copier: AccountId,
+    pub leader: AccountId,
+    pub coin_id: u64,
+    /// Whole tokens held in the vault for this copier/leader/coin.
+    pub tokens: u128,
+    /// NEAR cost basis of the vaulted tokens (curve cost + copy fees).
+    pub spent_yocto: u128,
+}
+
+/// One weekly season. `agents` is the set of agents with a season PnL
+/// entry; the pool is the prize pool at the last fee of the season
+/// (for a resolved season, the pool it distributed from).
+#[derive(BorshSerialize, BorshDeserialize, Clone)]
+pub struct Season {
+    pub id: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub pool_yocto: u128,
+    /// 0 active/unresolved, 1 resolved.
+    pub status: u8,
+    pub winners: Vec<AccountId>,
+    pub payouts_yocto: Vec<u128>,
+    pub agents: Vec<AccountId>,
+}
+
+// ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
 
@@ -329,6 +424,14 @@ pub struct ParamsView {
     pub meme_day_hours: u64,
     pub meme_reward_yocto: String,
     pub meme_min_reserve_yocto: String,
+    pub trading_fee_bp: u128,
+    pub copy_fee_bp: u128,
+    pub copy_min_per_trade_yocto: String,
+    pub copy_max_per_trade_yocto: String,
+    pub copy_min_max_total_yocto: String,
+    pub season_duration_ns: u64,
+    pub season_duration_days: u64,
+    pub season_top_shares_bp: Vec<u128>,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -438,6 +541,57 @@ pub struct MemeDayView {
     pub resolved: bool,
     pub winner_hash: Option<String>,
     pub winner: Option<AccountId>,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FollowView {
+    pub copier: AccountId,
+    pub leader: AccountId,
+    pub amount_per_trade_yocto: String,
+    pub max_total_yocto: String,
+    pub total_copied_yocto: String,
+    pub total_sell_volume_yocto: String,
+    pub fees_earned_yocto: String,
+    pub copy_public_key: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CopyStatsView {
+    pub leader: AccountId,
+    pub copier_count: u64,
+    pub total_copied_volume_yocto: String,
+    pub total_fees_earned_yocto: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct CopyPositionView {
+    pub copier: AccountId,
+    pub leader: AccountId,
+    pub coin_id: u64,
+    pub tokens: String,
+    pub spent_yocto: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SeasonView {
+    pub id: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub pool_yocto: String,
+    pub status: String,
+    pub winners: Vec<AccountId>,
+    pub payouts_yocto: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct SeasonEntryView {
+    pub account: AccountId,
+    pub realised_pnl_yocto: String,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -591,6 +745,62 @@ fn battle_status_str(status: u8) -> &'static str {
     }
 }
 
+/// A basis-point fee on `amount` (100 bp = 1%).
+pub fn fee_yocto(amount: u128, bp: u128) -> u128 {
+    amount * bp / 10_000
+}
+
+/// Copy amounts are valid when the per-trade amount is within
+/// [0.01, 10] NEAR and the max total is at least 0.1 NEAR.
+pub fn copy_amounts_valid(amount_per_trade_yocto: u128, max_total_yocto: u128) -> bool {
+    (COPY_MIN_PER_TRADE_YOCTO..=COPY_MAX_PER_TRADE_YOCTO)
+        .contains(&amount_per_trade_yocto)
+        && max_total_yocto >= COPY_MIN_MAX_TOTAL_YOCTO
+}
+
+/// A copy buy fits the cap when the running total plus this trade
+/// stays within the copier's max total.
+pub fn copy_within_cap(total_copied_yocto: u128, amount_yocto: u128, max_total_yocto: u128) -> bool {
+    total_copied_yocto.saturating_add(amount_yocto) <= max_total_yocto
+}
+
+/// Season id for a block timestamp (nanoseconds). Seasons are 7-day
+/// windows on the Monday 00:00 UTC grid anchored at 1970-01-05.
+pub fn season_id_for(timestamp_ns: u64) -> u64 {
+    timestamp_ns.saturating_sub(SEASON_ANCHOR_NS) / SEASON_DURATION_NS
+}
+
+pub fn season_start_ns(season_id: u64) -> u64 {
+    SEASON_ANCHOR_NS + season_id * SEASON_DURATION_NS
+}
+
+pub fn season_end_ns(season_id: u64) -> u64 {
+    season_start_ns(season_id) + SEASON_DURATION_NS
+}
+
+/// Split a season pool across the ranked agents (already sorted best
+/// first, positive PnL only). Top 3 take 50% / 30% / 20%; whatever is
+/// not paid out — fewer than 3 winners, or integer division dust —
+/// rolls into the next season's pool. Returns (payouts, rollover).
+pub fn distribute_pool(
+    pool_yocto: u128,
+    ranked: &[(AccountId, i128)],
+) -> (Vec<(AccountId, u128)>, u128) {
+    let mut payouts = Vec::new();
+    let mut paid = 0u128;
+    for (i, (account, pnl)) in ranked.iter().enumerate() {
+        if i >= SEASON_TOP_SHARES_BP.len() || *pnl <= 0 {
+            break;
+        }
+        let amount = pool_yocto * SEASON_TOP_SHARES_BP[i] / 10_000;
+        if amount > 0 {
+            payouts.push((account.clone(), amount));
+            paid += amount;
+        }
+    }
+    (payouts, pool_yocto.saturating_sub(paid))
+}
+
 // ---------------------------------------------------------------------------
 // Cross-contract interfaces
 // ---------------------------------------------------------------------------
@@ -631,6 +841,14 @@ pub trait ExtSelf {
     fn on_milestone_burn(&mut self, coin_id: u64, milestone: u64, amount: U128) -> bool;
     fn on_vote_executed(&mut self, round_id: u64, outcome: String) -> bool;
     fn on_airdrop_claim(&mut self, coin_id: u64, claimer: AccountId, tokens: U128) -> bool;
+    fn on_withdraw_copy(
+        &mut self,
+        coin_id: u64,
+        copier: AccountId,
+        leader: AccountId,
+        tokens: U128,
+        spent_yocto: U128,
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +858,43 @@ pub trait ExtSelf {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
+    coin_count: u64,
+    battle_count: u64,
+    agent_count: u64,
+    vote_round_count: u64,
+    coin_duel_count: u64,
+    coins: LookupMap<u64, Coin>,
+    token_to_coin: LookupMap<AccountId, u64>,
+    agents: LookupMap<AccountId, AgentStats>,
+    positions: LookupMap<String, Position>,
+    battles: LookupMap<u64, Battle>,
+    activity: Vector<TradeEvent>,
+    vote_rounds: LookupMap<u64, VoteRound>,
+    coin_duels: LookupMap<u64, CoinDuel>,
+    meme_days: LookupMap<String, MemeDay>,
+    // --- v2 fields (appended after the v1 fields, so the v1 Borsh
+    // layout is preserved and migrate() can copy the old state) ---
+    /// Live prize pool for the current weekly season (yoctoNEAR).
+    /// Trading fees accrue here; resolve_season pays winners from it
+    /// and the undistributed share stays here as rollover.
+    prize_pool_yocto: u128,
+    /// "copier:leader" -> Follow.
+    follows: LookupMap<String, Follow>,
+    /// leader -> copiers following them.
+    followers: LookupMap<AccountId, Vec<AccountId>>,
+    /// "copier:leader:coin_id" -> vaulted copied tokens.
+    copy_positions: LookupMap<String, CopyPosition>,
+    /// season id -> Season record.
+    seasons: LookupMap<u64, Season>,
+    /// "season_id:account" -> that season's realised PnL (yocto, signed).
+    season_pnl: LookupMap<String, i128>,
+}
+
+/// The v1 contract state, kept verbatim so migrate() can deserialise
+/// the live v1 bytes and rebuild the v2 state from them. Field order
+/// and types must match the v1 Contract exactly; do not edit.
+#[derive(BorshDeserialize)]
+pub struct OldContract {
     coin_count: u64,
     battle_count: u64,
     agent_count: u64,
@@ -675,6 +930,49 @@ impl Contract {
             vote_rounds: LookupMap::new(b"v"),
             coin_duels: LookupMap::new(b"d"),
             meme_days: LookupMap::new(b"m"),
+            prize_pool_yocto: 0,
+            follows: LookupMap::new(b"f"),
+            followers: LookupMap::new(b"w"),
+            copy_positions: LookupMap::new(b"k"),
+            seasons: LookupMap::new(b"s"),
+            season_pnl: LookupMap::new(b"n"),
+        }
+    }
+
+    /// Migrate the live v1 state to v2 without wiping it. Deploy the
+    /// v2 WASM over the v1 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v1 field and collection
+    /// verbatim (coins, agents, positions, battles, vote rounds, coin
+    /// duels, meme days, activity), and starts the v2 collections
+    /// empty on fresh prefixes that do not collide with the v1 ones.
+    /// The prize pool starts at 0 and season tracking starts at the
+    /// migration: trades before v2 are not retroactively scored into
+    /// a season. Calling migrate() twice fails: after the first call
+    /// the stored state is v2, which no longer deserialises as v1.
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let old: OldContract = env::state_read().expect("no v1 state to migrate");
+        Self {
+            coin_count: old.coin_count,
+            battle_count: old.battle_count,
+            agent_count: old.agent_count,
+            vote_round_count: old.vote_round_count,
+            coin_duel_count: old.coin_duel_count,
+            coins: old.coins,
+            token_to_coin: old.token_to_coin,
+            agents: old.agents,
+            positions: old.positions,
+            battles: old.battles,
+            activity: old.activity,
+            vote_rounds: old.vote_rounds,
+            coin_duels: old.coin_duels,
+            meme_days: old.meme_days,
+            prize_pool_yocto: 0,
+            follows: LookupMap::new(b"f"),
+            followers: LookupMap::new(b"w"),
+            copy_positions: LookupMap::new(b"k"),
+            seasons: LookupMap::new(b"s"),
+            season_pnl: LookupMap::new(b"n"),
         }
     }
 
@@ -878,6 +1176,11 @@ impl Contract {
         match env::promise_result(0) {
             PromiseResult::Successful(_) => {
                 let now = env::block_timestamp();
+                // The initial buy pays the 1% trading fee like any buy:
+                // the fee goes to the weekly prize pool and the coin
+                // reserve grows by cost minus fee.
+                let launch_fee = fee_yocto(cost_yocto.0, TRADING_FEE_BP);
+                self.record_trading_fee(launch_fee);
                 let coin = Coin {
                     id: coin_id,
                     token_id: token_id.clone(),
@@ -891,7 +1194,7 @@ impl Contract {
                     initial_buy_tokens: tokens.0,
                     unlock_at_ns: now + LOCK_DURATION_NS,
                     creator_sold_after_unlock: 0,
-                    near_reserve_yocto: cost_yocto.0,
+                    near_reserve_yocto: cost_yocto.0 - launch_fee,
                     total_spent_yocto: cost_yocto.0,
                     total_received_yocto: 0,
                     total_supply_tokens: TOTAL_SUPPLY_TOKENS,
@@ -980,7 +1283,12 @@ impl Contract {
         match env::promise_result(0) {
             PromiseResult::Successful(_) => {
                 let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
-                coin.near_reserve_yocto += cost_yocto.0;
+                // 1% trading fee to the weekly prize pool, taken from
+                // the amount that would otherwise enter the reserve.
+                // The buyer still gets the same tokens for the same cost.
+                let trade_fee = fee_yocto(cost_yocto.0, TRADING_FEE_BP);
+                self.record_trading_fee(trade_fee);
+                coin.near_reserve_yocto += cost_yocto.0 - trade_fee;
                 coin.total_spent_yocto += cost_yocto.0;
                 if !coin.holders.contains(&buyer) {
                     coin.holders.push(buyer.clone());
@@ -1374,6 +1682,97 @@ impl Contract {
     fn holder_tokens(&self, agent: &AccountId, coin_id: u64) -> u128 {
         let key = Self::position_key(agent, coin_id);
         self.positions.get(&key).map(|p| p.bought_tokens).unwrap_or(0)
+    }
+
+    // -- v2 helpers: trading fee and seasons -------------------------------
+
+    fn follow_key(copier: &AccountId, leader: &AccountId) -> String {
+        format!("{}:{}", copier, leader)
+    }
+
+    fn copy_position_key(copier: &AccountId, leader: &AccountId, coin_id: u64) -> String {
+        format!("{}:{}:{}", copier, leader, coin_id)
+    }
+
+    fn season_pnl_key(season_id: u64, agent: &AccountId) -> String {
+        format!("{}:{}", season_id, agent)
+    }
+
+    fn current_season_id(&self) -> u64 {
+        season_id_for(env::block_timestamp())
+    }
+
+    /// Create the current season's record if it has none yet. A new
+    /// record starts with the live prize pool, so rollover from the
+    /// previous season is already inside it.
+    fn ensure_season(&mut self, season_id: u64) -> Season {
+        if let Some(s) = self.seasons.get(&season_id) {
+            return s.clone();
+        }
+        let s = Season {
+            id: season_id,
+            start_ns: season_start_ns(season_id),
+            end_ns: season_end_ns(season_id),
+            pool_yocto: self.prize_pool_yocto,
+            status: 0,
+            winners: vec![],
+            payouts_yocto: vec![],
+            agents: vec![],
+        };
+        self.seasons.insert(season_id, s.clone());
+        s
+    }
+
+    /// Route a 1% trading fee to the weekly prize pool and keep the
+    /// current season record's pool in step with the live pool.
+    fn record_trading_fee(&mut self, fee_yocto: u128) {
+        if fee_yocto == 0 {
+            return;
+        }
+        self.prize_pool_yocto += fee_yocto;
+        let season_id = self.current_season_id();
+        let mut season = self.ensure_season(season_id);
+        season.pool_yocto = self.prize_pool_yocto;
+        self.seasons.insert(season_id, season);
+    }
+
+    /// Add a realised PnL delta to an agent's current-season total and
+    /// register the agent on the season's leaderboard.
+    fn add_season_pnl(&mut self, agent: &AccountId, delta_yocto: i128) {
+        if delta_yocto == 0 {
+            return;
+        }
+        let season_id = self.current_season_id();
+        let key = Self::season_pnl_key(season_id, agent);
+        let total = self.season_pnl.get(&key).copied().unwrap_or(0) + delta_yocto;
+        self.season_pnl.insert(key, total);
+        let mut season = self.ensure_season(season_id);
+        if !season.agents.contains(agent) {
+            season.agents.push(agent.clone());
+            self.seasons.insert(season_id, season);
+        }
+    }
+
+    fn season_view(&self, season: &Season) -> SeasonView {
+        SeasonView {
+            id: season.id,
+            start_ns: season.start_ns,
+            end_ns: season.end_ns,
+            pool_yocto: season.pool_yocto.to_string(),
+            status: if season.status == 1 {
+                "resolved".to_string()
+            } else if env::block_timestamp() >= season.end_ns {
+                "ended".to_string()
+            } else {
+                "active".to_string()
+            },
+            winners: season.winners.clone(),
+            payouts_yocto: season
+                .payouts_yocto
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+        }
     }
 
     // -- community supply votes -------------------------------------------
@@ -1786,6 +2185,384 @@ impl Contract {
         );
     }
 
+    // -- v2: auto copy ----------------------------------------------------
+    //
+    // The copier keeps funds in their own account and grants a
+    // function-call access key limited to the arena contract only, for
+    // copy_buy and copy_sell. An off-chain relayer (scripts/copy-
+    // relayer.mjs) holds that key and submits copy trades when the
+    // followed leader trades. Copied tokens are held in the arena
+    // vault: copy_buy never moves tokens to the copier's wallet, so
+    // copy_sell can sell them with the arena-only key, and the copier
+    // takes custody any time with withdraw_copy.
+
+    /// Follow a leader for auto copy. `amount_per_trade_yocto` is the
+    /// NEAR spent on every copied trade (0.01–10 NEAR);
+    /// `max_total_yocto` caps cumulative copy buy volume (min 0.1
+    /// NEAR). `copy_public_key` records the copier's copy key
+    /// (informational; the key itself is never held by the contract).
+    pub fn follow(
+        &mut self,
+        leader: AccountId,
+        amount_per_trade_yocto: U128,
+        max_total_yocto: U128,
+        copy_public_key: Option<String>,
+    ) {
+        let copier = env::predecessor_account_id();
+        assert_ne!(copier, leader, "cannot follow yourself");
+        assert!(
+            copy_amounts_valid(amount_per_trade_yocto.0, max_total_yocto.0),
+            "per-trade amount must be 0.01-10 NEAR and max total at least 0.1 NEAR"
+        );
+        let key = Self::follow_key(&copier, &leader);
+        assert!(self.follows.get(&key).is_none(), "already following this leader; unfollow first");
+        self.follows.insert(
+            key,
+            Follow {
+                copier: copier.clone(),
+                leader: leader.clone(),
+                amount_per_trade_yocto: amount_per_trade_yocto.0,
+                max_total_yocto: max_total_yocto.0,
+                total_copied_yocto: 0,
+                total_sell_volume_yocto: 0,
+                fees_earned_yocto: 0,
+                copy_public_key: copy_public_key.unwrap_or_default(),
+            },
+        );
+        let mut list = self.followers.get(&leader).cloned().unwrap_or_default();
+        if !list.contains(&copier) {
+            list.push(copier.clone());
+            self.followers.insert(leader.clone(), list);
+        }
+        self.record_event(
+            "follow",
+            copier,
+            0,
+            0,
+            0,
+            format!("started auto copy of {}", leader),
+        );
+    }
+
+    /// Stop auto copy of a leader. Future copies stop; vaulted copied
+    /// tokens stay withdrawable with withdraw_copy.
+    pub fn unfollow(&mut self, leader: AccountId) {
+        let copier = env::predecessor_account_id();
+        let key = Self::follow_key(&copier, &leader);
+        assert!(self.follows.get(&key).is_some(), "not following this leader");
+        self.follows.remove(&key);
+        if let Some(mut list) = self.followers.get(&leader).cloned() {
+            list.retain(|a| *a != copier);
+            self.followers.insert(leader.clone(), list);
+        }
+        self.record_event(
+            "unfollow",
+            copier,
+            0,
+            0,
+            0,
+            format!("stopped auto copy of {}", leader),
+        );
+    }
+
+    /// Copy a leader's buy. Called by the relayer with the copier's
+    /// copy key. Attaches the follow's per-trade amount (excess is
+    /// refunded). 1% of the amount goes to the leader; the rest buys
+    /// tokens on the curve into the arena vault, and the buy pays the
+    /// 1% trading fee to the prize pool like any buy.
+    #[payable]
+    pub fn copy_buy(&mut self, coin_id: u64, leader: AccountId) -> PromiseOrValue<bool> {
+        let copier = env::predecessor_account_id();
+        let attached = env::attached_deposit().as_yoctonear();
+        let key = Self::follow_key(&copier, &leader);
+        let mut follow = self.follows.get(&key).expect("no active follow for this leader").clone();
+        let amount = follow.amount_per_trade_yocto;
+        assert!(attached >= amount, "attach at least the per-trade amount");
+        assert!(
+            copy_within_cap(follow.total_copied_yocto, amount, follow.max_total_yocto),
+            "copy max total reached"
+        );
+        let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
+        assert!(coin.sold_tokens < coin.curve_cap_tokens, "curve sold out");
+        let max_tokens = coin.curve_cap_tokens - coin.sold_tokens;
+        let leader_fee = fee_yocto(amount, COPY_FEE_BP);
+        let net = amount - leader_fee;
+        let (tokens, cost) = buy_tokens_for_near(coin.sold_tokens, net, max_tokens);
+        assert!(tokens > 0, "amount buys zero tokens");
+        let trade_fee = fee_yocto(cost, TRADING_FEE_BP);
+        self.record_trading_fee(trade_fee);
+        coin.sold_tokens += tokens;
+        coin.near_reserve_yocto += cost - trade_fee;
+        coin.total_spent_yocto += cost;
+        if !coin.holders.contains(&copier) {
+            coin.holders.push(copier.clone());
+        }
+        self.coins.insert(coin_id, coin);
+        // Vault the tokens; cost basis is curve cost plus the copy fee.
+        let pos_key = Self::copy_position_key(&copier, &leader, coin_id);
+        let mut pos = self.copy_positions.get(&pos_key).cloned().unwrap_or(CopyPosition {
+            copier: copier.clone(),
+            leader: leader.clone(),
+            coin_id,
+            tokens: 0,
+            spent_yocto: 0,
+        });
+        pos.tokens += tokens;
+        pos.spent_yocto += cost + leader_fee;
+        self.copy_positions.insert(pos_key, pos);
+        self.track_agent(&copier);
+        let mut stats = self.get_agent_stats(&copier);
+        stats.total_spent_yocto += cost + leader_fee;
+        self.agents.insert(copier.clone(), stats);
+        follow.total_copied_yocto += amount;
+        follow.fees_earned_yocto += leader_fee;
+        self.follows.insert(key, follow);
+        self.record_event(
+            "copy_buy",
+            copier.clone(),
+            coin_id,
+            tokens,
+            amount,
+            format!("auto copy of {} buy; leader fee {} yocto", leader, leader_fee),
+        );
+        if leader_fee > 0 {
+            Promise::new(leader).transfer(NearToken::from_yoctonear(leader_fee));
+        }
+        let refund = attached - leader_fee - cost;
+        if refund > 0 {
+            Promise::new(copier).transfer(NearToken::from_yoctonear(refund));
+        }
+        if let Some(burn) = self.fire_milestones(coin_id) {
+            let (milestone, burn_amount) = burn;
+            let token_id = coin_token_id(self, coin_id);
+            let p = ext_ft_burn::ext(token_id)
+                .with_static_gas(Gas::from_tgas(20))
+                .burn(U128(burn_amount * DECIMAL_MULT))
+                .then(
+                    ext_self::ext(env::current_account_id())
+                        .with_static_gas(Gas::from_tgas(20))
+                        .on_milestone_burn(coin_id, milestone, U128(burn_amount)),
+                );
+            return PromiseOrValue::Promise(p);
+        }
+        PromiseOrValue::Value(true)
+    }
+
+    /// Copy a leader's sell, from the vaulted copy position. The
+    /// proceeds pay the 1% trading fee to the prize pool and a 1%
+    /// copy fee to the leader; the copier receives the rest. Sells do
+    /// not count against the max-total cap (they reduce exposure),
+    /// but they do count in the follow's sell volume stats.
+    pub fn copy_sell(&mut self, coin_id: u64, leader: AccountId, tokens: U128) {
+        let copier = env::predecessor_account_id();
+        let key = Self::follow_key(&copier, &leader);
+        assert!(
+            self.follows.get(&key).is_some(),
+            "no active follow for this leader"
+        );
+        let pos_key = Self::copy_position_key(&copier, &leader, coin_id);
+        let mut pos = self
+            .copy_positions
+            .get(&pos_key)
+            .expect("no copy position for this coin and leader")
+            .clone();
+        assert!(tokens.0 > 0, "tokens must be positive");
+        assert!(tokens.0 <= pos.tokens, "copy position smaller than sell");
+        let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
+        let whole_tokens = tokens.0.min(coin.sold_tokens);
+        assert!(whole_tokens > 0, "nothing to sell");
+        let proceeds = sell_proceeds_yocto(coin.sold_tokens, whole_tokens);
+        assert!(
+            proceeds <= coin.near_reserve_yocto,
+            "curve reserve insufficient"
+        );
+        let trade_fee = fee_yocto(proceeds, TRADING_FEE_BP);
+        let copy_fee = fee_yocto(proceeds, COPY_FEE_BP);
+        self.record_trading_fee(trade_fee);
+        let net = proceeds - trade_fee - copy_fee;
+        let now = env::block_timestamp();
+        // The rug rule also covers a creator copy-selling vaulted
+        // tokens after the lock expires.
+        if copier == coin.creator && now >= coin.unlock_at_ns {
+            coin.creator_sold_after_unlock += whole_tokens;
+            if now < coin.unlock_at_ns + RUG_WINDOW_NS
+                && coin.creator_sold_after_unlock > coin.initial_buy_tokens / 2
+            {
+                let mut stats = self.get_agent_stats(&copier);
+                stats.rugged = true;
+                self.agents.insert(copier.clone(), stats);
+            }
+        }
+        coin.sold_tokens -= whole_tokens;
+        coin.near_reserve_yocto -= proceeds;
+        coin.total_received_yocto += net;
+        self.coins.insert(coin_id, coin);
+        let avg_cost = if pos.tokens > 0 { pos.spent_yocto / pos.tokens } else { 0 };
+        let cost_of_sold = whole_tokens * avg_cost;
+        pos.tokens -= whole_tokens;
+        pos.spent_yocto = pos.spent_yocto.saturating_sub(cost_of_sold);
+        self.copy_positions.insert(pos_key, pos);
+        self.track_agent(&copier);
+        let mut stats = self.get_agent_stats(&copier);
+        stats.total_received_yocto += net;
+        stats.sells += 1;
+        if net > cost_of_sold {
+            stats.winning_sells += 1;
+        }
+        self.agents.insert(copier.clone(), stats);
+        let realised_delta = net as i128 - cost_of_sold as i128;
+        self.add_season_pnl(&copier, realised_delta);
+        let mut follow = self.follows.get(&key).expect("follow gone").clone();
+        follow.total_sell_volume_yocto += proceeds;
+        follow.fees_earned_yocto += copy_fee;
+        self.follows.insert(key, follow);
+        self.record_event(
+            "copy_sell",
+            copier.clone(),
+            coin_id,
+            whole_tokens,
+            net,
+            format!("auto copy of {} sell; leader fee {} yocto", leader, copy_fee),
+        );
+        if net > 0 {
+            Promise::new(copier).transfer(NearToken::from_yoctonear(net));
+        }
+        if copy_fee > 0 {
+            Promise::new(leader).transfer(NearToken::from_yoctonear(copy_fee));
+        }
+    }
+
+    /// Take custody of vaulted copied tokens: they move from the
+    /// arena vault to the copier's wallet.
+    pub fn withdraw_copy(&mut self, coin_id: u64, leader: AccountId, tokens: U128) {
+        let copier = env::predecessor_account_id();
+        let pos_key = Self::copy_position_key(&copier, &leader, coin_id);
+        let mut pos = self
+            .copy_positions
+            .get(&pos_key)
+            .expect("no copy position for this coin and leader")
+            .clone();
+        assert!(tokens.0 > 0, "tokens must be positive");
+        assert!(tokens.0 <= pos.tokens, "copy position smaller than withdrawal");
+        let avg_cost = if pos.tokens > 0 { pos.spent_yocto / pos.tokens } else { 0 };
+        let spent_out = tokens.0 * avg_cost;
+        pos.tokens -= tokens.0;
+        pos.spent_yocto = pos.spent_yocto.saturating_sub(spent_out);
+        self.copy_positions.insert(pos_key, pos);
+        ext_ft::ext(coin_token_id(self, coin_id))
+            .with_attached_deposit(NearToken::from_yoctonear(FT_TRANSFER_DEPOSIT))
+            .with_static_gas(Gas::from_tgas(30))
+            .ft_transfer(copier.clone(), U128(tokens.0 * DECIMAL_MULT), None)
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(30))
+                    .on_withdraw_copy(coin_id, copier, leader, tokens, U128(spent_out)),
+            );
+    }
+
+    /// Callback after a copy withdrawal. Restores the vaulted position
+    /// on failure.
+    #[private]
+    pub fn on_withdraw_copy(
+        &mut self,
+        coin_id: u64,
+        copier: AccountId,
+        leader: AccountId,
+        tokens: U128,
+        spent_yocto: U128,
+    ) -> bool {
+        match env::promise_result(0) {
+            PromiseResult::Successful(_) => {
+                self.record_event(
+                    "copy_withdraw",
+                    copier,
+                    coin_id,
+                    tokens.0,
+                    0,
+                    "withdrew vaulted copy tokens".to_string(),
+                );
+                true
+            }
+            _ => {
+                let pos_key = Self::copy_position_key(&copier, &leader, coin_id);
+                let mut pos = self.copy_positions.get(&pos_key).cloned().unwrap_or(CopyPosition {
+                    copier: copier.clone(),
+                    leader: leader.clone(),
+                    coin_id,
+                    tokens: 0,
+                    spent_yocto: 0,
+                });
+                pos.tokens += tokens.0;
+                pos.spent_yocto += spent_yocto.0;
+                self.copy_positions.insert(pos_key, pos);
+                false
+            }
+        }
+    }
+
+    // -- v2: weekly seasons ------------------------------------------------
+
+    /// Resolve a finished season. Anyone can call it. Ranks agents by
+    /// that season's realised PnL and pays the top 3 with a positive
+    /// PnL from the pool as 50% / 30% / 20%. Any undistributed share
+    /// stays in the live prize pool and rolls into the next season.
+    pub fn resolve_season(&mut self, season_id: u64) {
+        let now = env::block_timestamp();
+        assert!(now >= season_end_ns(season_id), "season not over yet");
+        let mut season = self.seasons.get(&season_id).cloned().unwrap_or(Season {
+            id: season_id,
+            start_ns: season_start_ns(season_id),
+            end_ns: season_end_ns(season_id),
+            pool_yocto: 0,
+            status: 0,
+            winners: vec![],
+            payouts_yocto: vec![],
+            agents: vec![],
+        });
+        assert_eq!(season.status, 0, "season already resolved");
+        let mut ranked: Vec<(AccountId, i128)> = season
+            .agents
+            .iter()
+            .map(|a| {
+                let pnl = self
+                    .season_pnl
+                    .get(&Self::season_pnl_key(season_id, a))
+                    .copied()
+                    .unwrap_or(0);
+                (a.clone(), pnl)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        let (payouts, _rollover) = distribute_pool(season.pool_yocto, &ranked);
+        let total_paid: u128 = payouts.iter().map(|(_, p)| *p).sum();
+        season.status = 1;
+        season.winners = payouts.iter().map(|(a, _)| a.clone()).collect();
+        season.payouts_yocto = payouts.iter().map(|(_, p)| *p).collect();
+        self.seasons.insert(season_id, season.clone());
+        // The live pool holds this season's pool plus any fees accrued
+        // since it ended; paying out of it leaves the rollover plus
+        // those newer fees in place for the next season.
+        self.prize_pool_yocto = self.prize_pool_yocto.saturating_sub(total_paid);
+        for (winner, amount) in &payouts {
+            if *amount > 0 {
+                Promise::new(winner.clone()).transfer(NearToken::from_yoctonear(*amount));
+            }
+        }
+        self.record_event(
+            "season_resolved",
+            env::predecessor_account_id(),
+            0,
+            0,
+            total_paid,
+            format!(
+                "season {} resolved: {} winner(s) paid, pool was {} yocto",
+                season_id,
+                payouts.len(),
+                season.pool_yocto
+            ),
+        );
+    }
+
     // -- views -------------------------------------------------------------
 
     pub fn get_params(&self) -> ParamsView {
@@ -1822,6 +2599,14 @@ impl Contract {
             meme_day_hours: 24,
             meme_reward_yocto: MEME_REWARD_YOCTO.to_string(),
             meme_min_reserve_yocto: MEME_MIN_RESERVE_YOCTO.to_string(),
+            trading_fee_bp: TRADING_FEE_BP,
+            copy_fee_bp: COPY_FEE_BP,
+            copy_min_per_trade_yocto: COPY_MIN_PER_TRADE_YOCTO.to_string(),
+            copy_max_per_trade_yocto: COPY_MAX_PER_TRADE_YOCTO.to_string(),
+            copy_min_max_total_yocto: COPY_MIN_MAX_TOTAL_YOCTO.to_string(),
+            season_duration_ns: SEASON_DURATION_NS,
+            season_duration_days: 7,
+            season_top_shares_bp: SEASON_TOP_SHARES_BP.to_vec(),
         }
     }
 
@@ -2036,6 +2821,154 @@ impl Contract {
         let coin = self.coins.get(&coin_id).expect("coin not found");
         U128(price_per_token_yocto(coin.sold_tokens))
     }
+
+    // -- v2 views: auto copy ----------------------------------------------
+
+    fn follow_view(&self, f: &Follow) -> FollowView {
+        FollowView {
+            copier: f.copier.clone(),
+            leader: f.leader.clone(),
+            amount_per_trade_yocto: f.amount_per_trade_yocto.to_string(),
+            max_total_yocto: f.max_total_yocto.to_string(),
+            total_copied_yocto: f.total_copied_yocto.to_string(),
+            total_sell_volume_yocto: f.total_sell_volume_yocto.to_string(),
+            fees_earned_yocto: f.fees_earned_yocto.to_string(),
+            copy_public_key: f.copy_public_key.clone(),
+        }
+    }
+
+    pub fn get_follow(&self, copier: AccountId, leader: AccountId) -> Option<FollowView> {
+        self.follows
+            .get(&Self::follow_key(&copier, &leader))
+            .map(|f| self.follow_view(f))
+    }
+
+    pub fn list_followers(&self, leader: AccountId) -> Vec<FollowView> {
+        match self.followers.get(&leader) {
+            Some(list) => list
+                .iter()
+                .filter_map(|copier| {
+                    self.follows
+                        .get(&Self::follow_key(copier, &leader))
+                        .map(|f| self.follow_view(f))
+                })
+                .collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn get_copy_stats(&self, leader: AccountId) -> CopyStatsView {
+        let mut volume = 0u128;
+        let mut fees = 0u128;
+        let mut count = 0u64;
+        if let Some(list) = self.followers.get(&leader) {
+            for copier in list.iter() {
+                if let Some(f) = self.follows.get(&Self::follow_key(copier, &leader)) {
+                    count += 1;
+                    volume += f.total_copied_yocto + f.total_sell_volume_yocto;
+                    fees += f.fees_earned_yocto;
+                }
+            }
+        }
+        CopyStatsView {
+            leader,
+            copier_count: count,
+            total_copied_volume_yocto: volume.to_string(),
+            total_fees_earned_yocto: fees.to_string(),
+        }
+    }
+
+    pub fn get_copy_position(
+        &self,
+        copier: AccountId,
+        leader: AccountId,
+        coin_id: u64,
+    ) -> Option<CopyPositionView> {
+        self.copy_positions
+            .get(&Self::copy_position_key(&copier, &leader, coin_id))
+            .map(|p| CopyPositionView {
+                copier: p.copier.clone(),
+                leader: p.leader.clone(),
+                coin_id: p.coin_id,
+                tokens: p.tokens.to_string(),
+                spent_yocto: p.spent_yocto.to_string(),
+            })
+    }
+
+    // -- v2 views: weekly seasons ------------------------------------------
+
+    /// Live prize pool for the current season (yoctoNEAR).
+    pub fn get_prize_pool(&self) -> U128 {
+        U128(self.prize_pool_yocto)
+    }
+
+    pub fn get_current_season(&self) -> SeasonView {
+        let id = season_id_for(env::block_timestamp());
+        match self.seasons.get(&id) {
+            Some(s) => self.season_view(s),
+            None => self.season_view(&Season {
+                id,
+                start_ns: season_start_ns(id),
+                end_ns: season_end_ns(id),
+                pool_yocto: self.prize_pool_yocto,
+                status: 0,
+                winners: vec![],
+                payouts_yocto: vec![],
+                agents: vec![],
+            }),
+        }
+    }
+
+    pub fn get_season(&self, season_id: u64) -> Option<SeasonView> {
+        match self.seasons.get(&season_id) {
+            Some(s) => Some(self.season_view(s)),
+            None => {
+                // A season with no record had no fees and no scored
+                // trades; synthesise it so the site can always show
+                // the last season's winners (empty) and the countdown.
+                Some(self.season_view(&Season {
+                    id: season_id,
+                    start_ns: season_start_ns(season_id),
+                    end_ns: season_end_ns(season_id),
+                    pool_yocto: if season_id == season_id_for(env::block_timestamp()) {
+                        self.prize_pool_yocto
+                    } else {
+                        0
+                    },
+                    status: 0,
+                    winners: vec![],
+                    payouts_yocto: vec![],
+                    agents: vec![],
+                }))
+            }
+        }
+    }
+
+    /// Agents ranked by realised PnL in a season, best first.
+    pub fn get_season_leaderboard(&self, season_id: u64) -> Vec<SeasonEntryView> {
+        let mut rows: Vec<SeasonEntryView> = match self.seasons.get(&season_id) {
+            Some(s) => s
+                .agents
+                .iter()
+                .map(|a| SeasonEntryView {
+                    account: a.clone(),
+                    realised_pnl_yocto: self
+                        .season_pnl
+                        .get(&Self::season_pnl_key(season_id, a))
+                        .copied()
+                        .unwrap_or(0)
+                        .to_string(),
+                })
+                .collect(),
+            None => vec![],
+        };
+        rows.sort_by(|a, b| {
+            let pa: i128 = a.realised_pnl_yocto.parse().unwrap_or(0);
+            let pb: i128 = b.realised_pnl_yocto.parse().unwrap_or(0);
+            pb.cmp(&pa)
+        });
+        rows
+    }
 }
 
 fn coin_token_id(contract: &Contract, coin_id: u64) -> AccountId {
@@ -2083,6 +3016,12 @@ impl FungibleTokenReceiver for Contract {
             proceeds <= coin.near_reserve_yocto,
             "curve reserve insufficient"
         );
+        // 1% trading fee to the weekly prize pool. The seller receives
+        // the proceeds minus the fee; realised PnL is scored on what
+        // the seller actually receives.
+        let trade_fee = fee_yocto(proceeds, TRADING_FEE_BP);
+        self.record_trading_fee(trade_fee);
+        let net_proceeds = proceeds - trade_fee;
         let now = env::block_timestamp();
 
         // Rug check: creator dumping more than half of its initial buy
@@ -2100,25 +3039,27 @@ impl FungibleTokenReceiver for Contract {
 
         coin.sold_tokens -= whole_tokens;
         coin.near_reserve_yocto -= proceeds;
-        coin.total_received_yocto += proceeds;
+        coin.total_received_yocto += net_proceeds;
         self.coins.insert(coin_id, coin.clone());
 
         // Position / cost basis / win rate / hold time / realised PnL.
         let key = Self::position_key(&sender_id, coin_id);
         let mut pos = self.positions.get(&key).cloned().unwrap_or_default();
         let mut stats = self.get_agent_stats(&sender_id);
-        stats.total_received_yocto += proceeds;
+        stats.total_received_yocto += net_proceeds;
         if pos.bought_tokens > 0 {
             let avg_cost = pos.spent_yocto / pos.bought_tokens;
             let cost_of_sold = whole_tokens * avg_cost;
             stats.sells += 1;
-            if proceeds > cost_of_sold {
+            if net_proceeds > cost_of_sold {
                 stats.winning_sells += 1;
             }
             let hold_ns = now.saturating_sub(pos.first_buy_ns);
             stats.hold_time_total_ns += hold_ns as u128;
             stats.hold_count += 1;
-            pos.realised_yocto += proceeds as i128 - cost_of_sold as i128;
+            let realised_delta = net_proceeds as i128 - cost_of_sold as i128;
+            pos.realised_yocto += realised_delta;
+            self.add_season_pnl(&sender_id, realised_delta);
             pos.spent_yocto = pos.spent_yocto.saturating_sub(cost_of_sold);
             pos.bought_tokens = pos.bought_tokens.saturating_sub(whole_tokens);
             if pos.bought_tokens == 0 {
@@ -2126,7 +3067,8 @@ impl FungibleTokenReceiver for Contract {
             }
         } else {
             stats.sells += 1;
-            pos.realised_yocto += proceeds as i128;
+            pos.realised_yocto += net_proceeds as i128;
+            self.add_season_pnl(&sender_id, net_proceeds as i128);
         }
         self.positions.insert(key, pos);
         self.agents.insert(sender_id.clone(), stats);
@@ -2135,11 +3077,11 @@ impl FungibleTokenReceiver for Contract {
             sender_id.clone(),
             coin_id,
             whole_tokens,
-            proceeds,
+            net_proceeds,
             "sold on the curve".to_string(),
         );
-        if proceeds > 0 {
-            Promise::new(sender_id).transfer(NearToken::from_yoctonear(proceeds));
+        if net_proceeds > 0 {
+            Promise::new(sender_id).transfer(NearToken::from_yoctonear(net_proceeds));
         }
         let unused = U128(amount.0 - whole_tokens * DECIMAL_MULT);
         PromiseOrValue::Value(unused)
@@ -2157,13 +3099,158 @@ mod tests {
 
     #[test]
     fn curve_buy_sell_roundtrip() {
-        // Buy 1 NEAR worth at launch, then sell it all back: proceeds must
-        // equal the cost exactly (symmetric curve, no fee).
+        // The pure curve is symmetric: buy 1 NEAR worth at launch, then
+        // sell it all back and the gross proceeds equal the cost. The
+        // 1% trading fee is applied at the trade layer, not in the
+        // curve math, so the seller nets 99% (see trading_fee test).
         let (tokens, cost) = buy_tokens_for_near(0, 1_000_000_000_000_000_000_000_000, MAX_CURVE_TOKENS);
         assert!(tokens > 0);
         assert!(cost <= 1_000_000_000_000_000_000_000_000);
         let proceeds = sell_proceeds_yocto(tokens, tokens);
         assert_eq!(proceeds, cost);
+    }
+
+    #[test]
+    fn trading_fee_is_one_percent() {
+        // A 1 NEAR buy pays 0.01 NEAR to the prize pool and 0.99 NEAR
+        // enters the coin reserve; a sell nets 99% of gross proceeds.
+        let cost = 1_000_000_000_000_000_000_000_000u128;
+        assert_eq!(fee_yocto(cost, TRADING_FEE_BP), 10_000_000_000_000_000_000_000);
+        assert_eq!(cost - fee_yocto(cost, TRADING_FEE_BP), 990_000_000_000_000_000_000_000);
+        assert_eq!(TRADING_FEE_BP, 100);
+    }
+
+    #[test]
+    fn copy_fee_is_one_percent_of_copy_amount() {
+        // A 1 NEAR copy: 0.01 NEAR to the leader, 0.99 NEAR buys tokens.
+        let amount = 1_000_000_000_000_000_000_000_000u128;
+        let leader_fee = fee_yocto(amount, COPY_FEE_BP);
+        assert_eq!(leader_fee, 10_000_000_000_000_000_000_000);
+        assert_eq!(amount - leader_fee, 990_000_000_000_000_000_000_000);
+        assert_eq!(COPY_FEE_BP, 100);
+    }
+
+    #[test]
+    fn copy_amount_limits() {
+        assert!(copy_amounts_valid(COPY_MIN_PER_TRADE_YOCTO, COPY_MIN_MAX_TOTAL_YOCTO));
+        assert!(copy_amounts_valid(COPY_MAX_PER_TRADE_YOCTO, COPY_MIN_MAX_TOTAL_YOCTO));
+        // Below the 0.01 NEAR per-trade minimum.
+        assert!(!copy_amounts_valid(COPY_MIN_PER_TRADE_YOCTO - 1, COPY_MIN_MAX_TOTAL_YOCTO));
+        // Above the 10 NEAR per-trade maximum.
+        assert!(!copy_amounts_valid(COPY_MAX_PER_TRADE_YOCTO + 1, COPY_MIN_MAX_TOTAL_YOCTO));
+        // Max total below the 0.1 NEAR minimum.
+        assert!(!copy_amounts_valid(COPY_MIN_PER_TRADE_YOCTO, COPY_MIN_MAX_TOTAL_YOCTO - 1));
+    }
+
+    #[test]
+    fn copy_cap_enforcement() {
+        let max = 150_000_000_000_000_000_000_000u128; // 0.15 NEAR
+        let per_trade = 100_000_000_000_000_000_000_000u128; // 0.1 NEAR
+        assert!(copy_within_cap(0, per_trade, max));
+        assert!(!copy_within_cap(per_trade, per_trade, max)); // 0.2 > 0.15
+        assert!(copy_within_cap(50_000_000_000_000_000_000_000, per_trade, max)); // 0.15 exactly
+    }
+
+    #[test]
+    fn season_grid_is_mondays() {
+        // Monday 2026-11-09 00:00 UTC is a season boundary.
+        let monday_ns = 1_794_182_400_000_000_000u64;
+        let id = season_id_for(monday_ns);
+        assert_eq!(season_start_ns(id), monday_ns);
+        assert_eq!(season_end_ns(id), monday_ns + SEASON_DURATION_NS);
+        // One second before the boundary is the previous season.
+        assert_eq!(season_id_for(monday_ns - 1), id - 1);
+        assert_eq!(season_end_ns(id - 1), monday_ns);
+        // The anchor itself is a Monday (1970-01-05).
+        assert_eq!(season_id_for(SEASON_ANCHOR_NS), 0);
+        assert_eq!(SEASON_DURATION_NS, 7 * 24 * 60 * 60 * 1_000_000_000);
+    }
+
+    fn test_account(name: &str) -> AccountId {
+        name.parse().unwrap()
+    }
+
+    #[test]
+    fn season_distribution_top_three_split() {
+        // 10 NEAR pool, three positive PnL agents: 5 / 3 / 2.
+        let pool = 10_000_000_000_000_000_000_000_000u128;
+        let ranked = vec![
+            (test_account("a.testnet"), 300i128),
+            (test_account("b.testnet"), 200i128),
+            (test_account("c.testnet"), 100i128),
+        ];
+        let (payouts, rollover) = distribute_pool(pool, &ranked);
+        assert_eq!(payouts.len(), 3);
+        assert_eq!(payouts[0].1, 5_000_000_000_000_000_000_000_000);
+        assert_eq!(payouts[1].1, 3_000_000_000_000_000_000_000_000);
+        assert_eq!(payouts[2].1, 2_000_000_000_000_000_000_000_000);
+        assert_eq!(rollover, 0);
+        assert_eq!(SEASON_TOP_SHARES_BP, [5000, 3000, 2000]);
+    }
+
+    #[test]
+    fn season_distribution_rolls_over_with_two_winners() {
+        // Only two positive PnL agents: 50% + 30% paid, 20% rolls over.
+        let pool = 10_000_000_000_000_000_000_000_000u128;
+        let ranked = vec![
+            (test_account("a.testnet"), 300i128),
+            (test_account("b.testnet"), 200i128),
+        ];
+        let (payouts, rollover) = distribute_pool(pool, &ranked);
+        assert_eq!(payouts.len(), 2);
+        assert_eq!(rollover, 2_000_000_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn season_distribution_rolls_over_with_one_winner() {
+        // One winner takes 50%; the other 50% rolls over.
+        let pool = 1_000_000_000_000_000_000_000_000u128;
+        let ranked = vec![(test_account("a.testnet"), 100i128)];
+        let (payouts, rollover) = distribute_pool(pool, &ranked);
+        assert_eq!(payouts.len(), 1);
+        assert_eq!(payouts[0].1, 500_000_000_000_000_000_000_000);
+        assert_eq!(rollover, 500_000_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn season_distribution_no_winners_rolls_everything_over() {
+        // Nobody with a positive PnL (all flat or losing): the whole
+        // pool rolls into the next season.
+        let pool = 1_000_000_000_000_000_000_000_000u128;
+        let ranked: Vec<(AccountId, i128)> = vec![
+            (test_account("a.testnet"), 0i128),
+            (test_account("b.testnet"), -50i128),
+        ];
+        let (payouts, rollover) = distribute_pool(pool, &ranked);
+        assert!(payouts.is_empty());
+        assert_eq!(rollover, pool);
+        let (payouts2, rollover2) = distribute_pool(pool, &[]);
+        assert!(payouts2.is_empty());
+        assert_eq!(rollover2, pool);
+    }
+
+    #[test]
+    fn season_distribution_only_top_three_paid() {
+        // Four positive agents: the fourth gets nothing, its share is
+        // not owed — the top three take the whole pool.
+        let pool = 10_000_000_000_000_000_000_000_000u128;
+        let ranked = vec![
+            (test_account("a.testnet"), 400i128),
+            (test_account("b.testnet"), 300i128),
+            (test_account("c.testnet"), 200i128),
+            (test_account("d.testnet"), 100i128),
+        ];
+        let (payouts, rollover) = distribute_pool(pool, &ranked);
+        assert_eq!(payouts.len(), 3);
+        assert_eq!(rollover, 0);
+    }
+
+    #[test]
+    fn season_distribution_zero_pool() {
+        let ranked = vec![(test_account("a.testnet"), 100i128)];
+        let (payouts, rollover) = distribute_pool(0, &ranked);
+        assert!(payouts.is_empty());
+        assert_eq!(rollover, 0);
     }
 
     #[test]

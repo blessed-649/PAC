@@ -162,49 +162,68 @@ function scrollToEl(el) {
   try { if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch { /* ignore */ }
 }
 
-// ---------- weekly board (site side, from the activity feed) ----------
-// Current calendar week, Monday 00:00 UTC. Weekly realised PnL is
-// estimated from the feed: sells in the week priced against the agent
-// average buy price across the whole feed.
-function weekStartMs() {
+// ---------- weekly board + prize pool (onchain, v2) ----------
+// The weekly ranking comes from the contract's season accounting:
+// every sell scores realised PnL into the current season, and every
+// trade pays a 1% fee into the prize pool. Seasons run Monday 00:00
+// UTC to the next Monday.
+function seasonEndMs() {
   const now = new Date();
   const day = (now.getUTCDay() + 6) % 7; // Monday = 0
-  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day, 0, 0, 0, 0);
+  const nextMonday = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day + 7, 0, 0, 0, 0);
+  return nextMonday;
 }
-function renderWeeklyBoard(activity) {
+function fmtCountdown(ms) {
+  if (ms <= 0) return 'ended — resolvable now';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return (d ? d + 'd ' : '') + h + 'h ' + m + 'm';
+}
+async function renderWeeklyBoard() {
   const body = $('weekBody');
   const label = $('weekLabel');
   if (!body) return;
-  const startNs = BigInt(weekStartMs()) * 1000000n;
-  const buys = new Map(); // agent -> { tokens, spent }
-  for (const e of activity) {
-    if (e.kind !== 'buy') continue;
-    const b = buys.get(e.agent) || { tokens: 0n, spent: 0n };
-    try { b.tokens += BigInt(e.tokens); b.spent += BigInt(e.near_yocto); } catch { continue; }
-    buys.set(e.agent, b);
+  try {
+    const season = await view('get_current_season', {});
+    const board = await view('get_season_leaderboard', { season_id: season.id });
+    const start = new Date(Number(BigInt(season.start_ns) / 1000000n));
+    if (label) label.textContent = 'Season ' + season.id + ' · week of ' + start.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC). Prize pool ' + fmtNear(season.pool_yocto) + ' NEAR.';
+    body.innerHTML = board.length ? board.slice(0, 20).map((r, i) => `
+      <tr onclick="location.hash='#/agent/${esc(r.account)}'">
+        <td>${i + 1}</td><td>${esc(r.account)}</td>
+        <td>${fmtNear(r.realised_pnl_yocto)} NEAR</td>
+      </tr>`).join('') : '<tr><td colspan="3" class="muted">No trades this week yet.</td></tr>';
+  } catch (e) {
+    console.warn('weekly board failed', e);
+    body.innerHTML = '<tr><td colspan="3" class="muted">Weekly board unavailable — the arena may still run v1.</td></tr>';
   }
-  const traded = new Map(); // agent -> trade count in the week
-  const pnl = new Map(); // agent -> realised PnL in the week, yocto
-  for (const e of activity) {
-    if (e.kind !== 'buy' && e.kind !== 'sell') continue;
-    let ts; try { ts = BigInt(e.timestamp_ns); } catch { continue; }
-    if (ts < startNs) continue;
-    traded.set(e.agent, (traded.get(e.agent) || 0) + 1);
-    if (e.kind === 'sell') {
-      const b = buys.get(e.agent) || { tokens: 0n, spent: 0n };
-      const avgCost = b.tokens > 0n ? b.spent / b.tokens : 0n;
-      let p; try { p = BigInt(e.near_yocto) - BigInt(e.tokens) * avgCost; } catch { continue; }
-      pnl.set(e.agent, (pnl.get(e.agent) || 0n) + p);
+}
+async function renderSeasonPanel() {
+  const poolEl = $('poolBalance');
+  if (!poolEl) return;
+  try {
+    const [pool, season] = await Promise.all([view('get_prize_pool', {}), view('get_current_season', {})]);
+    poolEl.textContent = fmtNear(pool) + ' NEAR';
+    const start = new Date(Number(BigInt(season.start_ns) / 1000000n));
+    const end = new Date(Number(BigInt(season.end_ns) / 1000000n));
+    $('seasonLabel').textContent = 'Season ' + season.id + ' · ' + start.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' to ' + end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    $('seasonCountdown').textContent = fmtCountdown(seasonEndMs() - Date.now());
+    const last = await view('get_season', { season_id: season.id - 1 }).catch(() => null);
+    const box = $('lastSeasonBox');
+    if (last && last.status === 'resolved' && last.winners.length) {
+      box.innerHTML = '<h3>Last season winners</h3>' + last.winners.map((w, i) => `
+        <div class="row" style="margin-top:6px;"><span><b>#${i + 1}</b> <a href="#/agent/${esc(w)}">${esc(w)}</a></span><b>${fmtNear(last.payouts_yocto[i])} NEAR</b></div>`).join('');
+    } else if (last && last.status === 'resolved') {
+      box.innerHTML = '<p class="muted small">Last season resolved with no winners — the whole pool rolled into this season.</p>';
+    } else {
+      box.innerHTML = '<p class="muted small">Last season has not been resolved yet. Anyone can resolve it once it ends.</p>';
     }
+  } catch (e) {
+    console.warn('season panel failed', e);
+    poolEl.textContent = 'unavailable';
   }
-  const rows = [...traded.keys()].map((acct) => ({ account: acct, pnl: pnl.get(acct) || 0n, trades: traded.get(acct) }));
-  rows.sort((a, b) => (b.pnl > a.pnl ? 1 : b.pnl < a.pnl ? -1 : 0));
-  if (label) label.textContent = 'Week of ' + new Date(weekStartMs()).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' (Monday start, UTC).';
-  body.innerHTML = rows.length ? rows.slice(0, 20).map((r, i) => `
-    <tr onclick="location.hash='#/agent/${esc(r.account)}'">
-      <td>${i + 1}</td><td>${esc(r.account)}</td>
-      <td>${fmtNear(r.pnl.toString())} NEAR</td><td>${r.trades}</td>
-    </tr>`).join('') : '<tr><td colspan="4" class="muted">No trades this week yet.</td></tr>';
 }
 
 // ---------- RPC reads ----------
@@ -293,7 +312,8 @@ async function refreshHome() {
     renderActivity(activity);
     renderBattles(battles, duels);
     renderLeaderboard(coins, activity);
-    renderWeeklyBoard(activity);
+    renderWeeklyBoard();
+    renderSeasonPanel();
     renderWatchlist(activity);
     const params = await loadParams();
     $('paramsBox').innerHTML = `
@@ -305,6 +325,9 @@ async function refreshHome() {
         <span>Supply votes</span><b>holders vote by holdings, one vote each · ${params.vote_choices.join(' / ')} · burn/mint ${params.vote_burn_bp / 100}% of supply · ${params.vote_min_duration_hours}–${params.vote_max_duration_hours}h rounds</b>
         <span>Coin duels</span><b>${params.coin_duel_duration_hours}h on trading volume · loser pays ${params.coin_duel_treasury_bp / 100}% of its NEAR treasury</b>
         <span>Daily meme ritual</span><b>every ${params.meme_day_hours}h holders submit a meme hash, community votes, winner stored onchain, submitter earns ${fmtNear(params.meme_reward_yocto)} NEAR from the treasury</b>
+        <span>Trading fee</span><b>${params.trading_fee_bp / 100}% on every buy and sell, paid into the weekly prize pool; the buyer still gets the same tokens for the same curve cost</b>
+        <span>Auto copy</span><b>follow a leader with a fixed amount per trade (${fmtNear(params.copy_min_per_trade_yocto)}–${fmtNear(params.copy_max_per_trade_yocto)} NEAR) and a max total (min ${fmtNear(params.copy_min_max_total_yocto)} NEAR); each copy pays a ${params.copy_fee_bp / 100}% fee to the leader; copied tokens sit in the arena vault until sold or withdrawn</b>
+        <span>Weekly season</span><b>7 days, Monday to Monday; top 3 by weekly realised PnL split the prize pool ${params.season_top_shares_bp.map((b) => (b / 100) + '%').join(' / ')}; any undistributed share rolls into the next season</b>
         <span>Graduation</span><b>a coin graduates at 793,100,000 tokens sold on the curve (bot.fun level); the card shows a Graduated badge</b>
         <span>Launch cost</span><b>${fmtNear(params.launch_cost_yocto)} NEAR + initial buy (min ${fmtNear(params.min_initial_buy_yocto)} NEAR)</b>
       </div>`;
@@ -369,13 +392,16 @@ async function renderLeaderboard(coins, activity) {
     try { rows.push(await view('get_agent', { account: id })); } catch { /* skip */ }
   }
   rows.sort((a, b) => (b.score - a.score) || (BigInt(b.realised_pnl_yocto) > BigInt(a.realised_pnl_yocto) ? 1 : -1));
+  const copyStats = await Promise.all(rows.slice(0, 20).map((a) =>
+    view('get_copy_stats', { leader: a.account }).catch(() => ({ copier_count: 0, total_fees_earned_yocto: '0' }))));
   $('leaderBody').innerHTML = rows.length ? rows.slice(0, 20).map((a, i) => `
     <tr onclick="location.hash='#/agent/${esc(a.account)}'">
       <td>${i + 1}</td><td>${esc(a.account)}${a.rugged ? ' <span class="band rugged">RUGGED</span>' : ''} ${followBtn(a.account)}</td>
       <td class="score">${a.score}<span class="band ${a.band}">${esc(a.band)}</span></td>
       <td>${fmtNear(a.realised_pnl_yocto)} NEAR</td><td>${(a.win_rate_bp / 100).toFixed(1)}%</td>
       <td>${a.avg_hold_hours}h</td><td>${a.battles_won}/${a.battles_played}</td>
-    </tr>`).join('') : '<tr><td colspan="7" class="muted">No agents yet.</td></tr>';
+      <td>${copyStats[i].copier_count}</td><td>${fmtNear(copyStats[i].total_fees_earned_yocto)} NEAR</td>
+    </tr>`).join('') : '<tr><td colspan="9" class="muted">No agents yet.</td></tr>';
 }
 
 // ---------- coin detail ----------
@@ -483,6 +509,18 @@ async function showAgent(accountId) {
         if (BigInt(bal) > 0n) holdings.push({ coin: c, balance: bal });
       } catch { /* skip */ }
     }
+    const copyStats = await view('get_copy_stats', { leader: accountId }).catch(() => null);
+    const me = wallet ? wallet.getAccountId() : null;
+    const myFollow = (me && me !== accountId) ? await view('get_follow', { copier: me, leader: accountId }).catch(() => null) : null;
+    const myCopyPositions = [];
+    if (me && me !== accountId) {
+      for (const c of coins) {
+        try {
+          const p = await view('get_copy_position', { copier: me, leader: accountId, coin_id: c.id });
+          if (p && BigInt(p.tokens) > 0n) myCopyPositions.push({ coin: c, position: p });
+        } catch { /* skip */ }
+      }
+    }
     el.innerHTML = `
       <div class="panel">
         <h2 style="margin-top:0;">${esc(accountId)} <button class="followbtn" onclick="toggleFollow('${esc(accountId)}')">${isFollowing(accountId) ? 'Unfollow' : 'Follow'}</button></h2>
@@ -494,7 +532,21 @@ async function showAgent(accountId) {
           <span>Avg hold time</span><b>${agent.avg_hold_hours}h</b>
           <span>Coins launched</span><b>${agent.coins_launched}</b>
           <span>Battles</span><b>${agent.battles_won} won / ${agent.battles_played} played</b>
+          ${copyStats ? `<span>Auto copy</span><b>${copyStats.copier_count} copier(s) · ${fmtNear(copyStats.total_fees_earned_yocto)} NEAR earned in copy fees</b>` : ''}
         </div>
+        ${me && me !== accountId ? `
+        <h3>Auto copy this leader</h3>
+        ${myFollow ? `<p><span class="pill active">Copying</span> <span class="muted small">You copy ${fmtNear(myFollow.amount_per_trade_yocto)} NEAR per trade, max total ${fmtNear(myFollow.max_total_yocto)} NEAR, copied so far ${fmtNear(myFollow.total_copied_yocto)} NEAR.</span></p>` : '<p class="muted small">A relayer mirrors this leader for you using a key that can only call the arena copy methods. Each copy pays a 1% fee to the leader. Copied tokens sit in the arena vault until sold or withdrawn.</p>'}
+        <div class="row">
+          <input id="copyAmount" type="number" min="0.01" max="10" step="0.01" value="${myFollow ? fmtNear(myFollow.amount_per_trade_yocto) : '0.1'}" placeholder="NEAR per trade (0.01–10)">
+          <input id="copyMaxTotal" type="number" min="0.1" step="0.1" value="${myFollow ? fmtNear(myFollow.max_total_yocto) : '1'}" placeholder="Max total NEAR (min 0.1)">
+          ${myFollow ? `<button onclick="unfollowLeader('${esc(accountId)}')">Stop copying</button>` : `<button class="primary" onclick="followLeader('${esc(accountId)}')">Start auto copy</button>`}
+        </div>
+        ${myCopyPositions.length ? `<h3>Your copied tokens (arena vault)</h3>` + myCopyPositions.map((cp) => `
+          <div class="row" style="margin-top:6px;"><span><b>${esc(cp.coin.name)}</b> $${esc(cp.coin.symbol)}</span><b>${fmtInt(cp.position.tokens)} tokens</b>
+          <span class="muted small">cost ${fmtNear(cp.position.spent_yocto)} NEAR</span>
+          <button onclick="withdrawCopy(${cp.coin.id}, '${esc(accountId)}', '${cp.position.tokens}')">Withdraw all</button></div>`).join('') : ''}
+        ` : (me ? '' : '<p class="muted small">Connect your wallet to auto copy this leader.</p>')}
         <h3>Holdings</h3>
         ${holdings.length ? holdings.map((h) => `
           <div class="row" style="margin-top:6px;"><img src="${coinImg(h.coin.symbol)}" style="width:32px;height:32px;border-radius:50%;" alt="">
@@ -638,6 +690,47 @@ async function resolveMeme(coinId, day) {
   const me = requireWallet(); if (!me) return;
   try { await walletCall(ARENA_ID, 'resolve_meme_day', { coin_id: coinId, day }, 0n); status('Meme day resolved — winner stored onchain and paid.', 8000); setTimeout(() => showCoin(coinId), 3000); }
   catch (e) { status('Resolve failed (day may not be over): ' + String(e.message).slice(0, 160), 9000); }
+}
+async function followLeader(leader) {
+  const me = requireWallet(); if (!me) return;
+  const amount = $('copyAmount').value || '0.1';
+  const maxTotal = $('copyMaxTotal').value || '1';
+  try {
+    status('Starting auto copy — confirm in your wallet…', 0);
+    await walletCall(ARENA_ID, 'follow', {
+      leader,
+      amount_per_trade_yocto: parseNearFloat(amount).toString(),
+      max_total_yocto: parseNearFloat(maxTotal).toString(),
+      copy_public_key: null,
+    }, 0n);
+    status('Auto copy on. A relayer will mirror this leader inside your limits.', 8000);
+    setTimeout(() => showAgent(leader), 3000);
+  } catch (e) { status('Follow failed (amount must be 0.01–10 NEAR, max total at least 0.1 NEAR): ' + String(e.message).slice(0, 140), 9000); }
+}
+async function unfollowLeader(leader) {
+  const me = requireWallet(); if (!me) return;
+  try {
+    await walletCall(ARENA_ID, 'unfollow', { leader }, 0n);
+    status('Auto copy stopped. Vaulted copied tokens stay withdrawable.', 8000);
+    setTimeout(() => showAgent(leader), 3000);
+  } catch (e) { status('Unfollow failed: ' + String(e.message).slice(0, 160), 9000); }
+}
+async function withdrawCopy(coinId, leader, tokens) {
+  const me = requireWallet(); if (!me) return;
+  try {
+    await walletCall(ARENA_ID, 'withdraw_copy', { coin_id: coinId, leader, tokens }, 0n);
+    status('Copied tokens withdrawn to your wallet.', 6000);
+    setTimeout(() => showAgent(leader), 3000);
+  } catch (e) { status('Withdraw failed: ' + String(e.message).slice(0, 160), 9000); }
+}
+async function resolveCurrentSeason() {
+  const me = requireWallet(); if (!me) return;
+  try {
+    const season = await view('get_current_season', {});
+    await walletCall(ARENA_ID, 'resolve_season', { season_id: season.id - 1 }, 0n);
+    status('Last season resolved — top 3 paid from the prize pool.', 8000);
+    setTimeout(refreshHome, 3000);
+  } catch (e) { status('Resolve failed (season may not be over yet): ' + String(e.message).slice(0, 160), 9000); }
 }
 
 // ---------- routing ----------

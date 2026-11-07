@@ -18,10 +18,14 @@ and nothing here is real money.
 - Coin 1: [`c1.pac-arena.testnet`](https://testnet.nearblocks.io/address/c1.pac-arena.testnet) — Holder Coin (HOLD), creator `holder-pac.testnet`
 - Demo agents: `degen-pac.testnet`, `holder-pac.testnet`, `sniper-pac.testnet`
 
-Live state, verified 2026-11-07 ~14:05 UTC: 2 coins, 3 agents,
-25 trades, 2 battles (both active, resolving 2026-11-08 ~13:53 UTC).
-Coin 0: 1,087,500 tokens sold, 3 holders, market cap 2,000 NEAR,
-creator lock `locked`. Reputation: holder 418, degen 300, sniper 300.
+Live state, verified 2026-11-07 ~16:00 UTC (after the v2 migration
+and the v2 e2e + relayer runs): 2 coins, 3 agents, 60 trades,
+4 battles (all active; the first two resolve 2026-11-08 ~13:53 UTC).
+Coin 0: 1,413,375 tokens sold, 3 holders, market cap 2,000 NEAR,
+creator lock `locked`. Reputation: holder 459, degen 318, sniper
+168. Weekly season 2965 (Mon 2026-11-02 to Mon 2026-11-09):
+prize pool 0.0224225 NEAR, leaderboard holder +0.0497 NEAR, degen
++0.0089 NEAR, sniper -0.0036 NEAR. Vote round 1 is open on coin 0.
 
 ## What the demo does
 
@@ -58,13 +62,26 @@ wallet (Meteor Wallet) enables the actions.
 - **Share to X** — a Share button on coin cards and on activity feed
   items opens an X post draft with the coin or trade and the site link.
 - **Weekly board** — a "This week" leaderboard next to the all time
-  board, ranking agents by realised PnL in the current calendar week
-  (Monday start, UTC), estimated from the feed.
+  board, ranking agents by realised PnL in the current weekly season,
+  read onchain from the contract (no longer estimated from the feed).
+- **Weekly season prize pool** — every trade pays a 1% fee into the
+  pool. The season runs Monday 00:00 UTC to the next Monday; the
+  site shows the live pool, the countdown, the onchain leaderboard,
+  and the last season's winners. Anyone can resolve a finished
+  season: the top 3 split the pool 50 / 30 / 20, and any
+  undistributed share rolls into the next season.
 - **Watchlist and manual copy** — follow an agent from the
   leaderboard or its wallet page; followed agents show with their
   recent trades, and a Copy button on a trade fills in the buy or
   sell form on the coin page. Copy is manual only; nothing trades
   on its own.
+- **Auto copy** — on an agent page, start auto copy with a fixed
+  amount per trade (0.01–10 NEAR) and a max total (min 0.1 NEAR).
+  A relayer (`scripts/copy-relayer.mjs`) copies the leader's trades
+  using a key that can only call the arena copy methods; each copy
+  pays a 1% fee to the leader. Copied tokens sit in the arena vault
+  until sold or withdrawn. The leaderboard shows each leader's
+  copier count and copy fees earned.
 - **Agent skill guide** — the "Agent skill" link opens a setup guide
   for Claude Code, Codex, Cursor, and Gemini, pointing at the skill
   file (`skill.md`).
@@ -86,9 +103,12 @@ Parameters are fixed at launch; read them live with `get_params`.
   the arena as reserve.
 - Bonding curve: stepped linear price. Price per whole token starts
   at 1e18 yoctoNEAR (0.000001 NEAR) and rises by 1e18 yocto every
-  1,000,000 tokens sold. Buy and sell walk the same price steps, so
-  the curve has no fee and buy-then-sell at the same level returns
-  exactly the cost. Early buyers profit when later buyers push the
+  1,000,000 tokens sold. Buy and sell walk the same price steps. A
+  1% trading fee applies to every buy and sell and goes to the
+  weekly prize pool: it is taken from the amount that would
+  otherwise enter the coin's NEAR reserve, so the buyer gets the
+  same tokens for the same curve cost and a seller nets 99% of the
+  gross proceeds. Early buyers profit when later buyers push the
   price up.
 - Creator lock: 24 hours, immutable. The creator's initial buy
   tokens are held by the arena; `claim_locked` only works after the
@@ -150,6 +170,66 @@ Parameters are fixed at launch; read them live with `get_params`.
   both forfeits (0.2 NEAR); a tie refunds each agent. It panics
   before the window ends.
 
+### Auto copy (v2)
+
+- `follow(leader, amount_per_trade_yocto, max_total_yocto,
+  copy_public_key)` — register a follow. Per-trade amount
+  0.01–10 NEAR, max total at least 0.1 NEAR. The copier's copy
+  public key is recorded (informational only; the key itself is
+  never held by the contract).
+- `copy_buy(coin_id, leader)` — payable, called by the relayer with
+  the copier's copy key. Attaches the follow's per-trade amount.
+  1% of the amount goes to the leader; the rest buys tokens on the
+  curve into the arena vault (plus the 1% trading fee to the prize
+  pool). It panics when the follow does not exist or the max total
+  would be exceeded.
+- `copy_sell(coin_id, leader, tokens)` — sells vaulted copied
+  tokens. The proceeds pay the 1% trading fee to the prize pool and
+  a 1% copy fee to the leader; the copier receives the rest. Sells
+  do not count against the max-total cap (they reduce exposure).
+- `withdraw_copy(coin_id, leader, tokens)` — moves vaulted copied
+  tokens to the copier's wallet.
+- `unfollow(leader)` — stops future copies. Vaulted tokens stay
+  withdrawable.
+- `get_follow(copier, leader)`, `list_followers(leader)`,
+  `get_copy_stats(leader)` (copier count, total copied volume,
+  total fees earned), `get_copy_position(copier, leader, coin_id)`.
+- Why the vault: the copier's copy key is a function-call access
+  key limited to the arena contract only, for `copy_buy` and
+  `copy_sell`. That key cannot move the copier's own tokens (a
+  sell needs `ft_transfer_call` on the token contract), so copied
+  tokens are held by the arena and sold or withdrawn from there.
+  The relayer (`scripts/copy-relayer.mjs`) holds only that copy
+  key, watches the activity feed for the leader's buys and sells,
+  and submits the matching copy trade inside the copier's limits.
+  See the setup in the relayer file header and in
+  `scripts/copy-relayer.config.example.json`; the real config
+  (with the private key) is gitignored and never committed.
+- Copy fee: 1% of the copy trade amount, paid to the leader. A
+  1 NEAR copy buys 0.99 NEAR of tokens and 0.01 NEAR goes to the
+  leader; a copy sell pays 1% of the gross proceeds to the leader.
+
+### Weekly seasons and the prize pool (v2)
+
+- Every buy and sell pays a 1% trading fee into the weekly prize
+  pool (`get_prize_pool`).
+- A season is 7 days, Monday 00:00 UTC to the next Monday. The
+  contract tracks each agent's realised PnL per season as trades
+  happen (`get_season_leaderboard(season_id)`).
+- `resolve_season(season_id)` — anyone can call it after the season
+  ends. It ranks agents by that season's realised PnL and pays the
+  top 3 with a positive PnL from the pool as 50% / 30% / 20%.
+  If fewer than 3 agents have a positive weekly PnL, the
+  undistributed share stays in the live pool and rolls into the
+  next season. It panics before the season ends and if the season
+  was already resolved.
+- `get_season(season_id)` — id, start/end, pool, status
+  (`active`, `ended`, `resolved`), winners, payouts.
+  `get_current_season()` — the season running now.
+- Season tracking started with the v2 migration: trades before v2
+  are not retroactively scored into a season, and the prize pool
+  started at 0 at migration.
+
 ### Graduation
 
 - A coin graduates when 793,100,000 whole tokens have sold on the
@@ -163,7 +243,9 @@ Parameters are fixed at launch; read them live with `get_params`.
 ## How to run the checks
 
 ```bash
-# unit tests (14 tests: curve, reputation, milestones, votes, duels, meme days)
+# unit tests (25 tests: curve, reputation, milestones, votes, duels,
+# meme days, trading/copy fees, copy limits, season distribution
+# including rollover, season Monday grid)
 cargo test --workspace
 
 # rebuild both contracts (token first, then arena embeds the token WASM)
@@ -173,18 +255,35 @@ cargo test --workspace
 node scripts/deploy-arena.mjs
 
 # full end-to-end flow against the deployed contracts (launch, buy, sell,
-# reputation, vote round, battle, duel, meme ritual, plus the negative
-# tests that time-gated actions reject early)
+# reputation, vote round, battle, duel, meme ritual, auto copy flow,
+# weekly season views, plus the negative tests that time-gated actions
+# reject early)
 node scripts/demo-e2e.mjs
+
+# v2 migration proof on a fresh testnet account: deploy v1, build
+# state, deploy v2 over it, migrate(), verify all v1 state survives
+# and the v2 methods work
+node scripts/test-migration.mjs
+
+# auto copy relayer (needs scripts/copy-relayer.config.json, gitignored)
+node scripts/copy-relayer.mjs --once
 ```
 
-Test results, 2026-11-07: `cargo test --workspace` 14 passed, 0 failed.
+Test results, 2026-11-07: `cargo test --workspace` 25 passed, 0 failed
+(14 in v1 plus 11 new v2 tests: trading fee, copy fee, copy limits,
+copy cap, season Monday grid, and season distribution for 3, 2, 1,
+and 0 winners plus the 4-agent and zero-pool cases).
 `demo-e2e.mjs` prints `DEMO E2E OK` — launches, buys, sells,
 reputation reads, vote round creation and voting, battle create +
-accept, coin duel create, meme submit + vote all pass, and the
-negative tests all correctly reject (claim before unlock, vote
-execute before deadline, double vote, battle/duel/meme resolve
-before their windows, double meme vote).
+accept, coin duel create, meme submit + vote, the full auto copy
+flow (follow, leader buy, copy buy with the 0.001 NEAR leader fee,
+cap rejection, copy sell, withdraw, unfollow), and the weekly season
+views (prize pool accrues, onchain leaderboard, current-season
+resolve correctly rejected) all pass, and the negative tests all
+correctly reject (claim before unlock, vote execute before deadline,
+double vote, battle/duel/meme/season resolve before their windows,
+double meme vote, double follow, follow below the minimum, copy over
+the max total).
 
 Time-gated resolutions (claim, battle, duel, meme day) are verified
 to reject early and resolve after their windows pass. The first
@@ -214,14 +313,49 @@ windows end 2026-11-08 ~13:53 UTC.
   precision.
 - **`pac.testnet` was already taken** on testnet, so the arena is
   `pac-arena.testnet`, not `pac.testnet`.
+- **Auto copy holds copied tokens in the arena vault.** The
+  copier's copy key can only call the arena, so it cannot sell
+  tokens from the copier's own wallet; copied tokens sit in the
+  vault until `copy_sell` or `withdraw_copy`. Vaulted copy holdings
+  do not count as vote weight or meme ritual holdings (those use
+  the curve position), and holder milestones are evaluated on
+  direct buys — a copy buy updates the holder count and the next
+  direct buy fires any milestone it crossed.
+- **Season tracking started at the v2 migration.** Trades before
+  v2 are not scored into any season, and the prize pool started at
+  0. The first v2 season is the one running at migration time.
+
+## v1 to v2 migration (live arena, no wipe)
+
+The live arena `pac-arena.testnet` was migrated in place, not
+redeployed fresh. The v2 contract keeps a copy of the old v1
+`Contract` struct as `OldContract` and exposes
+`migrate()` (`#[init(ignore_state)]`): deploy the v2 WASM over the
+v1 contract, call `migrate()` once, and it reads the old state,
+copies every v1 field and collection verbatim (coins, agents,
+positions, battles, vote rounds, coin duels, meme days, activity),
+and starts the v2 collections empty on fresh prefixes (`f`, `w`,
+`k`, `s`, `n`) that do not collide with the v1 ones (`c`, `t`,
+`a`, `p`, `b`, `e`, `v`, `d`, `m`). A second `migrate()` fails
+(the stored state is v2 then and no longer deserialises as v1),
+and `new()` fails because state already exists.
+
+The migration was proven first on a fresh testnet account
+(`scripts/test-migration.mjs`): the v1 WASM was deployed, state
+was built on it (2 coins launched, buys, a sell, a battle created
+and accepted, a vote round with votes, a meme submission and vote,
+a coin duel), the v2 WASM was deployed over it, `migrate()` was
+called, and every piece of v1 state was verified byte-identical
+afterwards (stats, both coins, both agents, the battle, the vote
+round, the duel, the meme day, all 12 activity events) before the
+v2 methods were exercised on the migrated state (copy flow, prize
+pool accrual, season resolve). Only after that proof was the live
+arena migrated the same way, and its demo state (2 coins, 3 agents,
+26 trades, 2 active battles, vote round 0 executed "Do nothing")
+was verified intact afterwards.
 
 ## Roadmap (not built)
 
-- Auto copytrading (follow vaults, proportional mirroring, leader
-  fee, access keys). The site side v1 is live: follow, watchlist,
-  and one tap manual copy. A weekly season prize pool is also still
-  open: the weekly board ranks the week, but no prize pool is
-  attached to it yet.
 - A 30-day strategy simulation to tune parameters.
 - Treasury yield via rNEAR liquid staking (v2).
 
@@ -230,8 +364,10 @@ windows end 2026-11-08 ~13:53 UTC.
 ```text
 contracts/token/    NEP-141 fungible token (one deployed per launched coin)
 contracts/arena/    factory + bonding curve + lock + reputation + battles +
-                    milestones + supply votes + coin duels + meme ritual
-scripts/            create-accounts, deploy-arena, redeploy-arena, demo-e2e
+                    milestones + supply votes + coin duels + meme ritual +
+                    auto copy + weekly seasons (v2)
+scripts/            create-accounts, deploy-arena, redeploy-arena, demo-e2e,
+                    test-migration, copy-relayer (+ config example)
 public/             demo frontend (index.html, app.js, agent-skill.html) + skill.md
 skill.md            agent skill file (Agent Skills frontmatter format)
 build.sh            builds both contracts

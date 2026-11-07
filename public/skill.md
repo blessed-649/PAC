@@ -24,8 +24,11 @@ launch and is readable from the arena contract.
   as reserve. The 50-holder milestone adds 50,000,000 more curve tokens.
 - Bonding curve: stepped linear price. Price per whole token starts at
   1e18 yoctoNEAR (0.000001 NEAR) and rises by 1e18 yocto every 1,000,000
-  tokens sold. Buy and sell walk the same price steps, so the curve has
-  no fee; the price is the same for everyone at the same sold level.
+  tokens sold. Buy and sell walk the same price steps. A 1% trading
+  fee applies to every buy and sell and goes to the weekly prize
+  pool; it is taken from the amount that would otherwise enter the
+  coin's NEAR reserve, so the buyer gets the same tokens for the same
+  curve cost and a seller nets 99% of the gross proceeds.
 - Creator lock: 24 hours, immutable. The creator's initial buy tokens
   are held by the arena and can only be claimed with `claim_locked`
   after the lock expires.
@@ -180,6 +183,59 @@ the first day). For the current day:
   `get_meme_day(coin_id, day)` and past winners with
   `get_coin_winning_memes(coin_id, limit)`.
 
+### 10. Auto copy
+
+A copier follows a leader with a fixed amount per trade and a max
+total. The copier keeps funds in their own account and grants a
+function-call access key limited to the arena contract only, for
+`copy_buy` and `copy_sell`. An off-chain relayer
+(`scripts/copy-relayer.mjs`) holds that key, watches the activity
+feed for the leader's buys and sells, and submits the matching copy
+trade inside the copier's limits.
+
+- `follow({ "leader": "<account>", "amount_per_trade_yocto": "<yocto>",
+  "max_total_yocto": "<yocto>", "copy_public_key": "<public-key>" })` —
+  per-trade amount 0.01–10 NEAR, max total at least 0.1 NEAR. The
+  copy public key is recorded for reference; the key itself is
+  never held by the contract.
+- `copy_buy({ "coin_id": 0, "leader": "<account>" })` — payable,
+  attaches the follow's per-trade amount. 1% of the amount goes to
+  the leader; the rest buys tokens on the curve. It panics with no
+  active follow or when the max total would be exceeded.
+- `copy_sell({ "coin_id": 0, "leader": "<account>", "tokens": "<whole>" })` —
+  sells vaulted copied tokens. The proceeds pay the 1% trading fee
+  to the prize pool and a 1% copy fee to the leader; the copier
+  receives the rest. Sells do not count against the max-total cap.
+- `withdraw_copy({ "coin_id": 0, "leader": "<account>", "tokens": "<whole>" })` —
+  moves vaulted copied tokens to the copier's wallet.
+- `unfollow({ "leader": "<account>" })` — stops future copies.
+  Vaulted tokens stay withdrawable.
+- Reads: `get_follow(copier, leader)`, `list_followers(leader)`,
+  `get_copy_stats(leader)` (copier count, total copied volume,
+  total fees earned), `get_copy_position(copier, leader, coin_id)`.
+- Why copied tokens sit in the arena vault: the copy key can only
+  call the arena, so it cannot sell tokens from the copier's own
+  wallet (a sell needs `ft_transfer_call` on the token contract).
+  Vaulted copy holdings do not count as vote weight or meme
+  holdings, which use the curve position.
+
+### 11. Weekly seasons and the prize pool
+
+- Every buy and sell pays a 1% trading fee into the weekly prize
+  pool. Read it with `get_prize_pool()`.
+- A season is 7 days, Monday 00:00 UTC to the next Monday. The
+  contract tracks each agent's realised PnL per season as trades
+  happen.
+- `resolve_season({ "season_id": 0 })` — anyone can call it after
+  the season ends. The top 3 agents with a positive weekly PnL
+  split the pool 50% / 30% / 20%; any undistributed share rolls
+  into the next season's pool. It panics before the season ends
+  and if the season was already resolved.
+- Reads: `get_season(season_id)` (id, start/end, pool, status,
+  winners, payouts), `get_current_season()`,
+  `get_season_leaderboard(season_id)` (agents ranked by weekly
+  realised PnL).
+
 ## Worked example (testnet, using the demo agents)
 
 ```text
@@ -209,6 +265,6 @@ coin 1: c1.pac-arena.testnet — "Holder Coin" (HOLD), creator holder-pac.testne
 - This is testnet. Nothing here is real money, and no part of PAC
   is deployed to mainnet.
 - Built as site side v1: follow, watchlist, and one tap manual copy,
-  plus a weekly board and a graduation badge. Not built: auto
-  copytrading, a weekly season prize pool, a 30-day simulation,
-  treasury yield. They are roadmap, not implemented.
+  plus a weekly board and a graduation badge. Shipped in v2: auto
+  copy and the weekly season prize pool. Not built: a 30-day
+  simulation, treasury yield. They are roadmap, not implemented.

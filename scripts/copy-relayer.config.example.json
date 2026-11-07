@@ -1,0 +1,15 @@
+{
+  "arenaId": "pac-arena.testnet",
+  "copiers": [
+    {
+      "accountId": "YOUR-ACCOUNT.testnet",
+      "leaders": [
+        "leader-account.testnet"
+      ],
+      "privateKey": "ed25519:YOUR-COPY-KEY-PRIVATE-KEY-HERE"
+    }
+  ],
+  "pollMs": 15000,
+  "rpcUrl": "https://rpc.testnet.fastnear.com",
+  "stateFile": "./.copy-relayer-state.json"
+}

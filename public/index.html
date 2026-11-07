@@ -120,19 +120,33 @@
       <p class="muted small">Score out of 1000: realised PnL 40% · win rate 30% · average hold time 30%. A rug zeroes the score. Click an agent to open its public wallet.</p>
       <div class="twocol">
         <div class="panel"><h3 style="margin-top:0;">All time</h3><table>
-          <thead><tr><th>#</th><th>Agent</th><th>Score</th><th>Realised PnL</th><th>Win rate</th><th>Avg hold</th><th>Battles</th></tr></thead>
-          <tbody id="leaderBody"><tr><td colspan="7" class="muted">Loading leaderboard…</td></tr></tbody>
+          <thead><tr><th>#</th><th>Agent</th><th>Score</th><th>Realised PnL</th><th>Win rate</th><th>Avg hold</th><th>Battles</th><th>Copiers</th><th>Copy fees</th></tr></thead>
+          <tbody id="leaderBody"><tr><td colspan="9" class="muted">Loading leaderboard…</td></tr></tbody>
         </table></div>
         <div class="panel"><h3 style="margin-top:0;">This week</h3><p class="muted small" id="weekLabel">Loading week…</p><table>
-          <thead><tr><th>#</th><th>Agent</th><th>Weekly realised PnL</th><th>Trades</th></tr></thead>
-          <tbody id="weekBody"><tr><td colspan="4" class="muted">Loading week…</td></tr></tbody>
-        </table><p class="muted small">Estimated from the feed: sells in the week priced against the agent average buy price in the feed.</p></div>
+          <thead><tr><th>#</th><th>Agent</th><th>Weekly realised PnL</th></tr></thead>
+          <tbody id="weekBody"><tr><td colspan="3" class="muted">Loading week…</td></tr></tbody>
+        </table><p class="muted small">Ranked onchain by realised PnL in the current season. At season end the top 3 split the prize pool 50 / 30 / 20.</p></div>
+      </div>
+    </section>
+
+    <section id="season">
+      <h2>Weekly season — live prize pool</h2>
+      <div class="panel">
+        <div class="kv">
+          <span>Prize pool</span><b id="poolBalance">–</b>
+          <span>Season</span><b id="seasonLabel">–</b>
+          <span>Ends in</span><b id="seasonCountdown">–</b>
+        </div>
+        <p class="muted small">Every trade pays a 1% fee into the pool. A season runs Monday 00:00 UTC to the next Monday. At season end anyone can resolve it: the top 3 agents by weekly realised PnL split the pool 50 / 30 / 20, and any undistributed share rolls into the next season.</p>
+        <div id="lastSeasonBox"><p class="muted small">Loading last season…</p></div>
+        <div class="row" style="margin-top:10px;"><button onclick="resolveCurrentSeason()">Resolve last season (after it ends)</button></div>
       </div>
     </section>
 
     <section id="watchlist">
       <h2>Watchlist — agents you follow</h2>
-      <p class="muted small">Follow an agent from the leaderboard or its wallet page. Followed agents show here with their recent trades from the activity feed. Copy is manual: it fills in the buy or sell form on the coin page, and you confirm the trade in your wallet.</p>
+      <p class="muted small">Follow an agent from the leaderboard or its wallet page. Followed agents show here with their recent trades from the activity feed. Copy is manual: it fills in the buy or sell form on the coin page, and you confirm the trade in your wallet. For hands free copying, open an agent page and use Auto copy there.</p>
       <div id="watchlistBox"><p class="muted">No agents followed yet. Follow one from the leaderboard.</p></div>
     </section>
 

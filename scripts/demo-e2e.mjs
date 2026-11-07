@@ -1,9 +1,12 @@
 // PAC demo end-to-end test on NEAR testnet.
 // Runs the full immediately-testable flow against the deployed arena:
 // launch, buy, sell, reputation, vote round + votes, agent battle create +
-// accept, coin duel create, meme submit + vote. Time-gated actions
-// (claim, battle/duel/vote/meme resolution) are verified to REJECT early;
-// their resolution is exercised live after the 24h windows pass.
+// accept, coin duel create, meme submit + vote, auto copy flow (follow,
+// leader buy, copy buy, leader fee, cap enforcement, copy sell, withdraw,
+// unfollow), and weekly season views (prize pool, leaderboard) with the
+// resolve of the current season correctly rejected. Time-gated actions
+// (claim, battle/duel/vote/meme/season resolution) are verified to REJECT
+// early; their resolution is exercised live after the windows pass.
 // Run: node scripts/demo-e2e.mjs
 import fs from 'node:fs';
 import { connect, keyStores, KeyPair, utils } from 'near-api-js';
@@ -234,8 +237,88 @@ console.log('  votes after:', JSON.stringify(day0.submissions.map((s) => s.votes
 await expectFail(call('degen', 'resolve_meme_day', { coin_id: 0, day: 0 }), 'resolve meme day before it ends');
 await expectFail(call('holder', 'vote_meme', { coin_id: 0, day: 0, submission_index: 0 }), 'double meme vote');
 
-// 11. Stats + activity.
-console.log('\n11. stats + activity');
+// 11. Auto copy flow (v2): sniper follows degen, degen buys, the
+// relayer step is simulated by calling copy_buy as sniper, the leader
+// earns the 1% copy fee, the max-total cap blocks a second copy, the
+// vaulted position sells and withdraws, then unfollow cleans up.
+console.log('\n11. auto copy flow (sniper follows degen, 0.1 NEAR/trade, max 0.15 NEAR)');
+try { await call('sniper', 'unfollow', { leader: accounts.degen.accountId }); console.log('  cleaned up a stale follow'); } catch { /* no follow yet */ }
+await call('sniper', 'follow', {
+  leader: accounts.degen.accountId,
+  amount_per_trade_yocto: parseNear('0.1'),
+  max_total_yocto: parseNear('0.15'),
+  copy_public_key: null,
+});
+await sleep(2000);
+let follow = await view('get_follow', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId });
+console.log('  follow:', JSON.stringify(follow));
+if (!follow || follow.amount_per_trade_yocto !== parseNear('0.1')) throw new Error('follow not stored');
+await expectFail(
+  call('sniper', 'follow', {
+    leader: accounts.degen.accountId,
+    amount_per_trade_yocto: parseNear('0.1'),
+    max_total_yocto: parseNear('0.15'),
+    copy_public_key: null,
+  }),
+  'double follow',
+);
+await expectFail(
+  call('sniper', 'follow', {
+    leader: accounts.holder.accountId,
+    amount_per_trade_yocto: parseNear('0.001'),
+    max_total_yocto: parseNear('0.15'),
+    copy_public_key: null,
+  }),
+  'follow below 0.01 NEAR per-trade minimum',
+);
+await callToken('degen', token0, 'storage_deposit', { account_id: accounts.degen.accountId }, '0.01').catch(() => {});
+await call('degen', 'buy', { coin_id: 0 }, '0.05');
+await sleep(2000);
+await call('sniper', 'copy_buy', { coin_id: 0, leader: accounts.degen.accountId }, '0.1');
+await sleep(2000);
+follow = await view('get_follow', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId });
+const copyStats = await view('get_copy_stats', { leader: accounts.degen.accountId });
+const copyPos = await view('get_copy_position', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId, coin_id: 0 });
+console.log('  after copy_buy: total_copied', follow.total_copied_yocto, '| leader fees', copyStats.total_fees_earned_yocto,
+  '| copiers', copyStats.copier_count, '| vaulted tokens', copyPos.tokens);
+if (follow.total_copied_yocto !== parseNear('0.1')) throw new Error('total_copied mismatch after copy_buy');
+if (copyStats.total_fees_earned_yocto !== parseNear('0.001')) throw new Error('leader copy fee should be 0.001 NEAR (1% of 0.1)');
+if (BigInt(copyPos.tokens) <= 0n) throw new Error('copy position empty after copy_buy');
+await expectFail(
+  call('sniper', 'copy_buy', { coin_id: 0, leader: accounts.degen.accountId }, '0.1'),
+  'second copy_buy over the 0.15 NEAR max total',
+);
+const halfCopy = (BigInt(copyPos.tokens) / 2n).toString();
+await call('sniper', 'copy_sell', { coin_id: 0, leader: accounts.degen.accountId, tokens: halfCopy });
+await sleep(2000);
+const posAfterSell = await view('get_copy_position', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId, coin_id: 0 });
+console.log('  vaulted tokens after copy_sell:', posAfterSell.tokens, '(was', copyPos.tokens + ')');
+if (BigInt(posAfterSell.tokens) >= BigInt(copyPos.tokens)) throw new Error('copy_sell did not reduce the vaulted position');
+await call('sniper', 'withdraw_copy', { coin_id: 0, leader: accounts.degen.accountId, tokens: posAfterSell.tokens });
+await sleep(2000);
+const posAfterWithdraw = await view('get_copy_position', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId, coin_id: 0 });
+console.log('  vaulted tokens after withdraw_copy:', posAfterWithdraw.tokens);
+if (posAfterWithdraw.tokens !== '0') throw new Error('withdraw_copy did not empty the vaulted position');
+await call('sniper', 'unfollow', { leader: accounts.degen.accountId });
+await sleep(3000);
+const followAfter = await view('get_follow', { copier: accounts.sniper.accountId, leader: accounts.degen.accountId });
+console.log('  follow after unfollow:', JSON.stringify(followAfter));
+if (followAfter !== null) throw new Error('unfollow did not remove the follow');
+
+// 12. Weekly season views (v2): the prize pool accrued 1% trading
+// fees from every buy and sell above; the leaderboard ranks the
+// week's realised PnL onchain. Resolving the current season must fail.
+console.log('\n12. weekly season (prize pool + leaderboard)');
+const pool = await view('get_prize_pool', {});
+const season = await view('get_current_season', {});
+const board = await view('get_season_leaderboard', { season_id: season.id });
+console.log('  prize pool:', pool, '| season:', JSON.stringify(season), '| leaderboard:', JSON.stringify(board));
+if (BigInt(pool) <= 0n) throw new Error('prize pool empty after a run full of trades');
+if (!board.length) throw new Error('season leaderboard empty after trades');
+await expectFail(call('degen', 'resolve_season', { season_id: season.id }), 'resolve current season before it ends');
+
+// 13. Stats + activity.
+console.log('\n13. stats + activity');
 const stats = await view('get_stats', {});
 console.log('  stats:', JSON.stringify(stats));
 const activity = await view('get_activity', { limit: 10 });
@@ -243,4 +326,4 @@ console.log('  activity kinds:', activity.map((e) => e.kind).join(', '));
 const params = await view('get_params', {});
 console.log('  params lock_hours:', params.lock_duration_hours, 'battle_forfeit:', params.battle_forfeit_yocto);
 
-console.log('\nDEMO E2E OK — immediate flows pass. Time-gated resolutions (claim, battle, duel, vote, meme) correctly reject early and will resolve after their 24h windows.');
+console.log('\nDEMO E2E OK — immediate flows pass, including the v2 auto copy flow and weekly season views. Time-gated resolutions (claim, battle, duel, vote, meme, season) correctly reject early and will resolve after their windows.');
