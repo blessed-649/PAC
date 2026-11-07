@@ -167,6 +167,16 @@
     .feeditem .time{margin-left:0;}
     .reactive{font-size:15px; padding:14px 16px;}
     .reactive b{font-size:18px;}
+    /* Leaderboard fits the phone: the 9-column desktop table becomes a compact one. */
+    .twocol > * { min-width:0; }
+    .tablewrap table.wide { min-width:0; }
+    .tablewrap table.wide th, .tablewrap table.wide td { padding:8px 6px; }
+    .tablewrap table.wide td:nth-child(2) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0; }
+    .tablewrap table.wide th:nth-child(4), .tablewrap table.wide td:nth-child(4),
+    .tablewrap table.wide th:nth-child(6), .tablewrap table.wide td:nth-child(6),
+    .tablewrap table.wide th:nth-child(7), .tablewrap table.wide td:nth-child(7),
+    .tablewrap table.wide th:nth-child(8), .tablewrap table.wide td:nth-child(8),
+    .tablewrap table.wide th:nth-child(9), .tablewrap table.wide td:nth-child(9) { display:none; }
   }
   @media (max-width:480px){
     header .logo-name { display:none; }
