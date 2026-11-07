@@ -50,9 +50,12 @@ launch and is readable from the arena contract.
 - Coin duels: 24 hours, metric is trading volume (NEAR bought plus
   NEAR sold). Loser pays 5% of its NEAR treasury to the winner.
 - Daily meme ritual: each 24-hour day counted from a coin's launch,
-  holders submit one meme hash each, holders vote once each, the most
-  voted hash is stored onchain, and the submitter earns 0.01 NEAR
-  from the coin treasury (only if the treasury holds at least 0.05 NEAR).
+  holders submit one meme hash each (plus an optional public meme
+  text, max 500 chars, that the AI judge reads), holders vote once
+  each, and the winner is picked 50% by the NEAR AI judge score
+  (humor, originality, relevance, each 0-100) and 50% by community
+  votes. The submitter earns 0.01 NEAR from the coin treasury
+  (only if the treasury holds at least 0.05 NEAR).
 
 ## Amounts in views are decimal strings
 
@@ -173,14 +176,28 @@ zeroes it.
 Days are 24-hour periods counted from the coin's launch (day 0 is
 the first day). For the current day:
 
-- `submit_meme({ "coin_id": 0, "meme_hash": "<hash>" })` — holders
+- `submit_meme({ "coin_id": 0, "meme_hash": "<hash>", "meme_text": "<optional text, max 500 chars>" })` — holders
   only, one submission per holder per day, hash up to 128 chars.
+  The meme text is public and is what the AI judge reads; the hash
+  alone cannot be scored. Omit it (or pass null) to submit a
+  hash only.
 - `vote_meme({ "coin_id": 0, "day": 0, "submission_index": 0 })` —
   one vote per holder per day, equal weight.
+- The AI judge (NEAR AI Cloud, model z-ai/glm-5.3-flash, running in
+  a TEE with attestation) scores each meme's text on humor,
+  originality and relevance, each 0-100, total 0-300. The score is
+  recorded onchain with `record_ai_score` (callable only by the
+  judge account, the arena itself) together with the SHA-256 digest
+  of the attestation evidence. The judge service is
+  `scripts/ai-meme-judge.mjs`; it reads its NEAR AI key only from
+  the `PAC_NEAR_AI_API_KEY` env var and fails closed without it.
 - `resolve_meme_day({ "coin_id": 0, "day": 0 })` — after the day
-  ends. Stores the winning hash onchain and pays the submitter
-  0.01 NEAR from the treasury. Read the day with
-  `get_meme_day(coin_id, day)` and past winners with
+  ends. The winner is the highest combined score: the AI total
+  and the community votes each count 50%. Stores the winning hash
+  onchain and pays the submitter 0.01 NEAR from the treasury.
+  A submission with no AI score counts 0 on the AI half. Read the
+  day with `get_meme_day(coin_id, day)` (each submission carries
+  `meme_text` and `ai_score`, or null) and past winners with
   `get_coin_winning_memes(coin_id, limit)`.
 
 ### 10. Auto copy

@@ -24,6 +24,15 @@
 //!   8. Daily meme ritual — each 24h day holders submit a meme hash and
 //!      vote (one vote each); the winning hash is stored onchain and its
 //!      submitter earns 0.01 NEAR from the coin treasury when it affords it.
+//!  11. AI meme judge — the daily meme ritual is judged by NEAR AI. Each
+//!      submission can carry its meme in words (max 500 chars, public);
+//!      a TEE-attested NEAR AI Cloud completion scores it on humor,
+//!      originality and relevance (0-100 each), and the arena account
+//!      records the score onchain with the attestation hash. The daily
+//!      winner is the highest combined score: AI total and community
+//!      votes each count 50%. NEAR AI does not run the arena, the curve,
+//!      the reputation score, or the site — those are deterministic
+//!      onchain math and a plain frontend; the AI only judges memes.
 //!   9. Auto copy — a copier follows a leader with a fixed amount per
 //!      trade and a max total. Copied tokens are held in the arena vault
 //!      (the copier's copy key can only call the arena, so a direct sell
@@ -39,6 +48,9 @@
 //!
 //! Cut for v1 (roadmap, not built): simulation. The rnear-sdk treasury
 //! yield stays v2, not built. Copy and weekly seasons shipped in v2.
+//! The AI meme judge shipped in v3: NEAR AI scores each meme on humor,
+//! originality and relevance, and the daily winner is AI 50% plus
+//! community vote 50%.
 
 use near_contract_standards::fungible_token::metadata::FungibleTokenMetadata;
 use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
@@ -125,6 +137,17 @@ pub const MEME_DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 pub const MEME_REWARD_YOCTO: u128 = 10_000_000_000_000_000_000_000;
 /// The treasury must hold at least this much NEAR for the reward to pay.
 pub const MEME_MIN_RESERVE_YOCTO: u128 = 50_000_000_000_000_000_000_000;
+/// Max meme text length (chars) the AI judge reads. The text is public:
+/// a meme is meant to be seen, so it is stored onchain in the clear.
+pub const MEME_TEXT_MAX_CHARS: usize = 500;
+/// AI judge weights for the daily winner: the AI score and the community
+/// vote each count 50% (basis points, so 5000 = 50%).
+pub const AI_WEIGHT_BP: u128 = 5000;
+pub const COMMUNITY_WEIGHT_BP: u128 = 5000;
+/// Max AI score per dimension (humor / originality / relevance).
+pub const AI_SCORE_MAX: u64 = 100;
+/// Max attestation hash length (a SHA-256 hex digest is 64 chars).
+pub const ATTESTATION_HASH_MAX_CHARS: usize = 128;
 
 // ---------------------------------------------------------------------------
 // v2 parameters: auto copy and weekly seasons. Fixed at v2 launch,
@@ -329,6 +352,25 @@ pub struct MemeDay {
     pub winner: Option<AccountId>,
 }
 
+/// The NEAR AI judge's score for one meme submission. The judge is the
+/// arena account itself (see record_ai_score): a TEE-attested NEAR AI
+/// Cloud completion scores the meme text on humor, originality and
+/// relevance (0-100 each). `total` is the sum (0-300). `attestation_hash`
+/// is the SHA-256 hex digest of the attestation evidence for that
+/// completion, so anyone can check the score came from a real attested
+/// NEAR AI run. Stored in its own collection (ai_scores) keyed by
+/// "coin_id:day:submission_index", so the v2 MemeDay bytes keep
+/// deserialising unchanged.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub struct AiScore {
+    pub humor: u64,
+    pub originality: u64,
+    pub relevance: u64,
+    pub total: u64,
+    pub attestation_hash: String,
+}
+
 // ---------------------------------------------------------------------------
 // v2 stored data: auto copy and weekly seasons
 // ---------------------------------------------------------------------------
@@ -424,6 +466,14 @@ pub struct ParamsView {
     pub meme_day_hours: u64,
     pub meme_reward_yocto: String,
     pub meme_min_reserve_yocto: String,
+    /// The NEAR AI judge: the arena account itself records AI scores
+    /// (record_ai_score only accepts calls from the arena account).
+    pub ai_judge_account: AccountId,
+    /// Winner weights in basis points: AI score 50%, community vote 50%.
+    pub ai_weight_bp: u128,
+    pub community_weight_bp: u128,
+    /// Max meme text length in chars.
+    pub meme_text_max_chars: u64,
     pub trading_fee_bp: u128,
     pub copy_fee_bp: u128,
     pub copy_min_per_trade_yocto: String,
@@ -525,10 +575,24 @@ pub struct CoinDuelView {
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(crate = "near_sdk::serde")]
+pub struct AiScoreView {
+    pub humor: u64,
+    pub originality: u64,
+    pub relevance: u64,
+    pub total: u64,
+    pub attestation_hash: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(crate = "near_sdk::serde")]
 pub struct MemeSubmissionView {
     pub submitter: AccountId,
     pub meme_hash: String,
+    /// The meme text the AI judge reads, if the submitter gave one.
+    pub meme_text: Option<String>,
     pub votes: u64,
+    /// The NEAR AI judge's score, if the judge has scored this meme.
+    pub ai_score: Option<AiScoreView>,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -764,6 +828,21 @@ pub fn copy_within_cap(total_copied_yocto: u128, amount_yocto: u128, max_total_y
     total_copied_yocto.saturating_add(amount_yocto) <= max_total_yocto
 }
 
+/// Combined daily meme winner score (0-200): the AI total (0-300)
+/// scaled to 0-100, plus the community votes scaled to 0-100 against
+/// the day's highest vote count, so the AI judge and the community
+/// each count 50%. No votes at all on the day means the community
+/// half is 0 for every submission.
+pub fn combined_meme_score(ai_total: u64, votes: u64, max_votes: u64) -> u128 {
+    let ai_part = (ai_total as u128) * 100 / 300;
+    let community_part = if max_votes > 0 {
+        (votes as u128) * 100 / (max_votes as u128)
+    } else {
+        0
+    };
+    ai_part + community_part
+}
+
 /// Season id for a block timestamp (nanoseconds). Seasons are 7-day
 /// windows on the Monday 00:00 UTC grid anchored at 1970-01-05.
 pub fn season_id_for(timestamp_ns: u64) -> u64 {
@@ -888,11 +967,19 @@ pub struct Contract {
     seasons: LookupMap<u64, Season>,
     /// "season_id:account" -> that season's realised PnL (yocto, signed).
     season_pnl: LookupMap<String, i128>,
+    // --- v3 fields (appended after the v2 fields, so the v2 Borsh
+    // layout is preserved and migrate() can copy the old state) ---
+    /// "coin_id:day:submission_index" -> the meme text the AI judge
+    /// reads. Kept in its own collection so the v2 MemeDay bytes keep
+    /// deserialising unchanged.
+    meme_texts: LookupMap<String, String>,
+    /// "coin_id:day:submission_index" -> the NEAR AI judge's score.
+    ai_scores: LookupMap<String, AiScore>,
 }
 
-/// The v1 contract state, kept verbatim so migrate() can deserialise
-/// the live v1 bytes and rebuild the v2 state from them. Field order
-/// and types must match the v1 Contract exactly; do not edit.
+/// The v2 contract state, kept verbatim so migrate() can deserialise
+/// the live v2 bytes and rebuild the v3 state from them. Field order
+/// and types must match the v2 Contract exactly; do not edit.
 #[derive(BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
@@ -909,6 +996,12 @@ pub struct OldContract {
     vote_rounds: LookupMap<u64, VoteRound>,
     coin_duels: LookupMap<u64, CoinDuel>,
     meme_days: LookupMap<String, MemeDay>,
+    prize_pool_yocto: u128,
+    follows: LookupMap<String, Follow>,
+    followers: LookupMap<AccountId, Vec<AccountId>>,
+    copy_positions: LookupMap<String, CopyPosition>,
+    seasons: LookupMap<u64, Season>,
+    season_pnl: LookupMap<String, i128>,
 }
 
 #[near]
@@ -936,22 +1029,23 @@ impl Contract {
             copy_positions: LookupMap::new(b"k"),
             seasons: LookupMap::new(b"s"),
             season_pnl: LookupMap::new(b"n"),
+            meme_texts: LookupMap::new(b"x"),
+            ai_scores: LookupMap::new(b"j"),
         }
     }
 
-    /// Migrate the live v1 state to v2 without wiping it. Deploy the
-    /// v2 WASM over the v1 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v1 field and collection
+    /// Migrate the live v2 state to v3 without wiping it. Deploy the
+    /// v3 WASM over the v2 contract, then call this once. It reads the
+    /// old state as OldContract, copies every v2 field and collection
     /// verbatim (coins, agents, positions, battles, vote rounds, coin
-    /// duels, meme days, activity), and starts the v2 collections
-    /// empty on fresh prefixes that do not collide with the v1 ones.
-    /// The prize pool starts at 0 and season tracking starts at the
-    /// migration: trades before v2 are not retroactively scored into
-    /// a season. Calling migrate() twice fails: after the first call
-    /// the stored state is v2, which no longer deserialises as v1.
+    /// duels, meme days, activity, prize pool, follows, copy positions,
+    /// seasons), and starts the v3 collections (meme texts, AI scores)
+    /// empty on fresh prefixes that do not collide with the v1/v2 ones.
+    /// Calling migrate() twice fails: after the first call the stored
+    /// state is v3, which no longer deserialises as v2.
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v1 state to migrate");
+        let old: OldContract = env::state_read().expect("no v2 state to migrate");
         Self {
             coin_count: old.coin_count,
             battle_count: old.battle_count,
@@ -967,12 +1061,14 @@ impl Contract {
             vote_rounds: old.vote_rounds,
             coin_duels: old.coin_duels,
             meme_days: old.meme_days,
-            prize_pool_yocto: 0,
-            follows: LookupMap::new(b"f"),
-            followers: LookupMap::new(b"w"),
-            copy_positions: LookupMap::new(b"k"),
-            seasons: LookupMap::new(b"s"),
-            season_pnl: LookupMap::new(b"n"),
+            prize_pool_yocto: old.prize_pool_yocto,
+            follows: old.follows,
+            followers: old.followers,
+            copy_positions: old.copy_positions,
+            seasons: old.seasons,
+            season_pnl: old.season_pnl,
+            meme_texts: LookupMap::new(b"x"),
+            ai_scores: LookupMap::new(b"j"),
         }
     }
 
@@ -2067,10 +2163,16 @@ impl Contract {
     /// Submit a meme hash to the current day's board for a coin. Only
     /// holders can submit, one submission per holder per day. The hash is
     /// any short string (for example an IPFS CID); only the hash is stored.
-    pub fn submit_meme(&mut self, coin_id: u64, meme_hash: String) {
+    /// `meme_text` is the meme itself in words (max 500 chars, public):
+    /// the NEAR AI judge reads it to score humor, originality and
+    /// relevance. It is stored alongside the hash in its own collection.
+    pub fn submit_meme(&mut self, coin_id: u64, meme_hash: String, meme_text: Option<String>) {
         let submitter = env::predecessor_account_id();
         assert!(!meme_hash.trim().is_empty(), "meme hash required");
         assert!(meme_hash.len() <= 128, "meme hash too long");
+        if let Some(t) = &meme_text {
+            assert!(t.chars().count() <= MEME_TEXT_MAX_CHARS, "meme text too long");
+        }
         let coin = self.coins.get(&coin_id).expect("coin not found").clone();
         assert!(
             self.holder_tokens(&submitter, coin_id) > 0,
@@ -2092,11 +2194,18 @@ impl Contract {
             !md.submissions.iter().any(|s| s.submitter == submitter),
             "one submission per holder per day"
         );
+        let index = md.submissions.len() as u64;
         md.submissions.push(MemeSubmission {
             submitter: submitter.clone(),
             meme_hash: meme_hash.clone(),
             votes: 0,
         });
+        if let Some(t) = meme_text {
+            if !t.trim().is_empty() {
+                self.meme_texts
+                    .insert(format!("{}:{}:{}", coin_id, day, index), t);
+            }
+        }
         self.meme_days.insert(key, md);
         self.record_event(
             "meme_submitted",
@@ -2139,10 +2248,82 @@ impl Contract {
         );
     }
 
-    /// Resolve a finished day: the submission with the most votes wins
-    /// (ties go to the earliest submission). The winning hash is stored
-    /// onchain and the submitter is paid 0.01 NEAR from the coin treasury
-    /// when the treasury holds at least 0.05 NEAR. Anyone can resolve.
+    /// Record the NEAR AI judge's score for one meme submission. Only
+    /// the arena account itself can call this (the judge is the arena
+    /// account; the judge service signs with the arena key). Each
+    /// dimension is 0-100; `total` is their sum (0-300).
+    /// `attestation_hash` is the SHA-256 hex digest of the attestation
+    /// evidence for the NEAR AI completion that produced the score, so
+    /// anyone can check the score came from a real attested run.
+    pub fn record_ai_score(
+        &mut self,
+        coin_id: u64,
+        day: u64,
+        submission_index: u64,
+        humor: u64,
+        originality: u64,
+        relevance: u64,
+        attestation_hash: String,
+    ) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "only the arena account (the AI judge) records scores"
+        );
+        assert!(humor <= AI_SCORE_MAX, "humor out of range");
+        assert!(originality <= AI_SCORE_MAX, "originality out of range");
+        assert!(relevance <= AI_SCORE_MAX, "relevance out of range");
+        assert!(
+            attestation_hash.len() <= ATTESTATION_HASH_MAX_CHARS,
+            "attestation hash too long"
+        );
+        let key = format!("{}:{}", coin_id, day);
+        let md = self.meme_days.get(&key).expect("no submissions this day").clone();
+        assert!(!md.resolved, "day already resolved");
+        let idx = submission_index as usize;
+        assert!(idx < md.submissions.len(), "bad submission");
+        let total = humor + originality + relevance;
+        self.ai_scores.insert(
+            format!("{}:{}:{}", coin_id, day, submission_index),
+            AiScore {
+                humor,
+                originality,
+                relevance,
+                total,
+                attestation_hash: attestation_hash.clone(),
+            },
+        );
+        self.record_event(
+            "ai_scored",
+            env::current_account_id(),
+            coin_id,
+            0,
+            0,
+            format!(
+                "AI judged meme {} on day {}: humor {} originality {} relevance {} total {}",
+                idx, day, humor, originality, relevance, total
+            ),
+        );
+    }
+
+    /// Combined winner score for a meme submission (0-200): the AI total
+    /// scaled to 0-100 plus the community votes scaled to 0-100 against
+    /// the day's highest vote count, so AI and community each count 50%.
+    /// A submission with no AI score counts 0 on the AI half.
+    fn meme_combined_score(&self, coin_id: u64, day: u64, index: u64, votes: u64, max_votes: u64) -> u128 {
+        let ai_total = self
+            .ai_scores
+            .get(&format!("{}:{}:{}", coin_id, day, index))
+            .map(|s| s.total)
+            .unwrap_or(0);
+        combined_meme_score(ai_total, votes, max_votes)
+    }
+
+    /// Resolve a finished day: the submission with the highest combined
+    /// score wins (AI total and community votes each count 50%; ties go
+    /// to the earliest submission). The winning hash is stored onchain
+    /// and the submitter is paid 0.01 NEAR from the coin treasury when
+    /// the treasury holds at least 0.05 NEAR. Anyone can resolve.
     pub fn resolve_meme_day(&mut self, coin_id: u64, day: u64) {
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
         let now = env::block_timestamp();
@@ -2154,13 +2335,28 @@ impl Contract {
         let mut md = self.meme_days.get(&key).expect("no submissions that day").clone();
         assert!(!md.resolved, "day already resolved");
         assert!(!md.submissions.is_empty(), "no submissions to resolve");
+        let max_votes = md.submissions.iter().map(|s| s.votes).max().unwrap_or(0);
         let mut best = 0usize;
-        for (i, s) in md.submissions.iter().enumerate() {
-            if s.votes > md.submissions[best].votes {
+        let mut best_score = self.meme_combined_score(
+            coin_id,
+            day,
+            0,
+            md.submissions[0].votes,
+            max_votes,
+        );
+        for (i, s) in md.submissions.iter().enumerate().skip(1) {
+            let score = self.meme_combined_score(coin_id, day, i as u64, s.votes, max_votes);
+            if score > best_score {
                 best = i;
+                best_score = score;
             }
         }
         let winner = md.submissions[best].clone();
+        let winner_ai_total = self
+            .ai_scores
+            .get(&format!("{}:{}:{}", coin_id, day, best as u64))
+            .map(|s| s.total)
+            .unwrap_or(0);
         md.resolved = true;
         md.winner_hash = Some(winner.meme_hash.clone());
         md.winner = Some(winner.submitter.clone());
@@ -2179,8 +2375,8 @@ impl Contract {
             0,
             reward,
             format!(
-                "day {} winning meme: {} ({} votes, reward {} yocto)",
-                day, winner.meme_hash, winner.votes, reward
+                "day {} winning meme: {} ({} votes, AI total {}/300, combined {}, reward {} yocto)",
+                day, winner.meme_hash, winner.votes, winner_ai_total, best_score, reward
             ),
         );
     }
@@ -2599,6 +2795,10 @@ impl Contract {
             meme_day_hours: 24,
             meme_reward_yocto: MEME_REWARD_YOCTO.to_string(),
             meme_min_reserve_yocto: MEME_MIN_RESERVE_YOCTO.to_string(),
+            ai_judge_account: env::current_account_id(),
+            ai_weight_bp: AI_WEIGHT_BP,
+            community_weight_bp: COMMUNITY_WEIGHT_BP,
+            meme_text_max_chars: MEME_TEXT_MAX_CHARS as u64,
             trading_fee_bp: TRADING_FEE_BP,
             copy_fee_bp: COPY_FEE_BP,
             copy_min_per_trade_yocto: COPY_MIN_PER_TRADE_YOCTO.to_string(),
@@ -2743,10 +2943,22 @@ impl Contract {
             submissions: md
                 .submissions
                 .iter()
-                .map(|s| MemeSubmissionView {
-                    submitter: s.submitter.clone(),
-                    meme_hash: s.meme_hash.clone(),
-                    votes: s.votes,
+                .enumerate()
+                .map(|(i, s)| {
+                    let sub_key = format!("{}:{}:{}", coin_id, day, i as u64);
+                    MemeSubmissionView {
+                        submitter: s.submitter.clone(),
+                        meme_hash: s.meme_hash.clone(),
+                        meme_text: self.meme_texts.get(&sub_key).cloned(),
+                        votes: s.votes,
+                        ai_score: self.ai_scores.get(&sub_key).map(|a| AiScoreView {
+                            humor: a.humor,
+                            originality: a.originality,
+                            relevance: a.relevance,
+                            total: a.total,
+                            attestation_hash: a.attestation_hash.clone(),
+                        }),
+                    }
                 })
                 .collect(),
             voters: md.voters.len() as u64,
@@ -3390,5 +3602,39 @@ mod tests {
     fn curve_cap_grows_with_tranche() {
         assert_eq!(MAX_CURVE_TOKENS + MILESTONE_TRANCHE_TOKENS, 850_000_000);
         assert!(MAX_CURVE_TOKENS + MILESTONE_TRANCHE_TOKENS < TOTAL_SUPPLY_TOKENS);
+    }
+
+    #[test]
+    fn ai_meme_score_is_fifty_fifty() {
+        // Perfect AI (300/300) and top votes: 100 + 100 = 200.
+        assert_eq!(combined_meme_score(300, 5, 5), 200);
+        // No AI score and no votes: 0.
+        assert_eq!(combined_meme_score(0, 0, 0), 0);
+        // AI only (no votes that day): AI half only.
+        assert_eq!(combined_meme_score(300, 0, 0), 100);
+        // Votes only (no AI score): community half only.
+        assert_eq!(combined_meme_score(0, 5, 5), 100);
+        // Half AI (150/300) and half the votes (2 of max 4): 50 + 50 = 100.
+        assert_eq!(combined_meme_score(150, 2, 4), 100);
+    }
+
+    #[test]
+    fn ai_meme_score_beats_pure_votes() {
+        // The AI favourite (270/300, 1 vote of max 3) beats the vote
+        // leader (0 AI, 3 votes): 90 + 33 = 123 vs 0 + 100 = 100.
+        assert!(combined_meme_score(270, 1, 3) > combined_meme_score(0, 3, 3));
+        // ...but a poor AI score cannot beat a clear community winner:
+        // 30/300 AI (10) + all votes (100) = 110 vs 150/300 AI (50) +
+        // no votes (0) = 50.
+        assert!(combined_meme_score(30, 3, 3) > combined_meme_score(150, 0, 3));
+    }
+
+    #[test]
+    fn ai_score_weights_and_limits() {
+        // Total is the plain sum of the three 0-100 dimensions, max 300.
+        assert_eq!(90u64 + 80 + 70, 240);
+        assert_eq!(AI_SCORE_MAX, 100);
+        assert_eq!(AI_WEIGHT_BP + COMMUNITY_WEIGHT_BP, 10_000);
+        assert_eq!(MEME_TEXT_MAX_CHARS, 500);
     }
 }

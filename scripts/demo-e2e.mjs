@@ -222,9 +222,9 @@ async function tryStep(label, fn) {
   try { await fn(); console.log(`  ${label}: ok`); }
   catch (e) { console.log(`  ${label}: skipped (${String(e.message).slice(0, 90)})`); }
 }
-await tryStep('holder submit', () => call('holder', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashHolder001' }));
-await tryStep('sniper submit', () => call('sniper', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashSniper002' }));
-await tryStep('degen submit', () => call('degen', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashDegen003' }));
+await tryStep('holder submit', () => call('holder', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashHolder001', meme_text: 'Degen coin to the moon, holder coin to the bank.' }));
+await tryStep('sniper submit', () => call('sniper', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashSniper002', meme_text: 'Sniper bought the dip and the dip bought him back.' }));
+await tryStep('degen submit', () => call('degen', 'submit_meme', { coin_id: 0, meme_hash: 'QmDemoMemeHashDegen003', meme_text: null }));
 await sleep(2000);
 let day0 = await view('get_meme_day', { coin_id: 0, day: 0 });
 console.log('  submissions:', JSON.stringify(day0.submissions));
@@ -236,6 +236,24 @@ day0 = await view('get_meme_day', { coin_id: 0, day: 0 });
 console.log('  votes after:', JSON.stringify(day0.submissions.map((s) => s.votes)));
 await expectFail(call('degen', 'resolve_meme_day', { coin_id: 0, day: 0 }), 'resolve meme day before it ends');
 await expectFail(call('holder', 'vote_meme', { coin_id: 0, day: 0, submission_index: 0 }), 'double meme vote');
+// v3 AI judge: params are 50/50, the judge is the arena account, the
+// meme text is stored, and only the judge can record a score. (No score
+// is recorded here: the live judge service does that, with a real
+// attestation, once the NEAR AI key is set.)
+const aiParams = await view('get_params', {});
+if (aiParams.ai_judge_account !== ARENA_ID || aiParams.ai_weight_bp !== 5000 || aiParams.community_weight_bp !== 5000 || aiParams.meme_text_max_chars !== 500) {
+  throw new Error('v3 AI judge params mismatch: ' + JSON.stringify(aiParams));
+}
+console.log('  [ok] AI judge params 50/50, judge is the arena, text max 500');
+const holderSub = day0.submissions.find((s) => s.meme_hash === 'QmDemoMemeHashHolder001');
+if (holderSub && holderSub.meme_text !== null && holderSub.meme_text !== 'Degen coin to the moon, holder coin to the bank.') {
+  throw new Error('holder meme_text is wrong: ' + holderSub.meme_text);
+}
+console.log('  [ok] meme_text field present on submissions' + (holderSub && holderSub.meme_text ? ' (text stored)' : ' (pre-v3 submission, text null as expected)'));
+await expectFail(
+  call('degen', 'record_ai_score', { coin_id: 0, day: 0, submission_index: 0, humor: 80, originality: 70, relevance: 90, attestation_hash: 'aa'.repeat(32) }),
+  'record_ai_score from a non-judge account',
+);
 
 // 11. Auto copy flow (v2): sniper follows degen, degen buys, the
 // relayer step is simulated by calling copy_buy as sniper, the leader

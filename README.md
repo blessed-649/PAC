@@ -154,11 +154,18 @@ Parameters are fixed at launch; read them live with `get_params`.
 
 - Days are 24-hour periods counted from a coin's launch.
 - `submit_meme` — holders only, one submission per holder per day,
-  hash up to 128 chars.
+  hash up to 128 chars, plus an optional `meme_text` (max 500 chars,
+  public) that the AI judge reads. The hash alone cannot be scored.
 - `vote_meme` — one vote per holder per day, equal weight.
-- `resolve_meme_day` after the day ends stores the winning hash
-  onchain and pays the submitter 0.01 NEAR from the coin treasury
-  (only if the treasury holds at least 0.05 NEAR).
+- `record_ai_score` — the AI judge (the arena account) records the
+  NEAR AI score for a submission: humor, originality and relevance,
+  each 0-100, total 0-300, plus the SHA-256 digest of the NEAR AI
+  attestation evidence. Only the arena account can call it.
+- `resolve_meme_day` after the day ends picks the winner by combined
+  score: the AI total and the community votes each count 50%. It
+  stores the winning hash onchain and pays the submitter 0.01 NEAR
+  from the coin treasury (only if the treasury holds at least
+  0.05 NEAR). A submission with no AI score counts 0 on the AI half.
 
 ### Agent battles
 
@@ -240,12 +247,45 @@ Parameters are fixed at launch; read them live with `get_params`.
   detail page, and in the rules box, with progress toward the
   threshold shown before then.
 
+## What NEAR AI does in PAC
+
+NEAR AI Cloud runs the meme judge for the daily meme ritual. That is
+the only thing NEAR AI does in PAC.
+
+- **The judge.** For each day, the judge service
+  (`scripts/ai-meme-judge.mjs`) fetches the day's meme submissions
+  from the arena and sends each meme's text to NEAR AI Cloud
+  (model `z-ai/glm-5.3-flash`) with a fixed prompt that asks for three
+  scores, each 0 to 100: humor, originality and relevance. The exact
+  prompt is documented at the top of the judge script so the judging
+  is reproducible.
+- **Verifiable.** The judging runs in a TEE with attestation. The
+  service fetches the attestation evidence for each scoring call
+  (GET `/v1/attestation/report`, trusted only when the report echoes
+  the request nonce) and stores the SHA-256 hex digest of that
+  evidence onchain next to the score, so anyone can check that a real
+  attested NEAR AI run produced it.
+- **Onchain, 50/50.** The AI score is stored onchain with
+  `record_ai_score` (callable only by the judge account, the arena
+  itself) and combines 50/50 with the community vote to pick the
+  daily winner: the AI total scaled 0-100 plus the votes scaled 0-100
+  against the day's max votes. The winner still earns 0.01 NEAR.
+- **The key.** The judge service reads the NEAR AI API key only from
+  the `PAC_NEAR_AI_API_KEY` environment variable and fails closed
+  without it. The key is never hardcoded, never printed and never
+  committed. Live AI scoring cannot run until that key is provided.
+- **What NEAR AI does NOT do.** NEAR AI does not run the arena, the
+  bonding curve, the reputation score, the battles, the copy trading,
+  the prize pools, or the site. Those are deterministic onchain math
+  and a plain frontend. The AI only judges memes, and even there the
+  community vote still counts for half.
+
 ## How to run the checks
 
 ```bash
-# unit tests (25 tests: curve, reputation, milestones, votes, duels,
-# meme days, trading/copy fees, copy limits, season distribution
-# including rollover, season Monday grid)
+# unit tests (28 tests: curve, reputation, milestones, votes, duels,
+# meme days, AI meme score 50/50, trading/copy fees, copy limits,
+# season distribution including rollover, season Monday grid)
 cargo test --workspace
 
 # rebuild both contracts (token first, then arena embeds the token WASM)
@@ -264,6 +304,14 @@ node scripts/demo-e2e.mjs
 # state, deploy v2 over it, migrate(), verify all v1 state survives
 # and the v2 methods work
 node scripts/test-migration.mjs
+
+# v3 migration proof (AI meme judge) on a fresh testnet account:
+# deploy v2, build state, deploy v3 over it, migrate(), verify all
+# v2 state survives and the v3 AI judge methods work
+node scripts/test-migration-v3.mjs
+
+# AI meme judge (needs PAC_NEAR_AI_API_KEY; fails closed without it)
+node scripts/ai-meme-judge.mjs --coin 0 --day 0 --dry-run
 
 # auto copy relayer (needs scripts/copy-relayer.config.json, gitignored)
 node scripts/copy-relayer.mjs --once
@@ -353,6 +401,29 @@ pool accrual, season resolve). Only after that proof was the live
 arena migrated the same way, and its demo state (2 coins, 3 agents,
 26 trades, 2 active battles, vote round 0 executed "Do nothing")
 was verified intact afterwards.
+
+## v2 to v3 migration (AI meme judge, live arena, no wipe)
+
+The same pattern, one step further. The v3 contract keeps the v2
+`Contract` struct verbatim as `OldContract` and exposes its own
+`migrate()`: deploy the v3 WASM over the v2 contract, call
+`migrate()` once, and it copies every v2 field and collection
+verbatim and starts the two new collections (`meme_texts` on prefix
+`x`, `ai_scores` on prefix `j`) empty. Meme text and AI scores live
+in separate collections keyed `coin_id:day:submission_index`, so the
+existing v2 `MemeDay` and `MemeSubmission` Borsh bytes deserialise
+unchanged; the views present the text and score alongside them.
+Proven first on a fresh testnet account
+(`scripts/test-migration-v3.mjs`): v2 state (2 coins, buys, a sell,
+a battle, a vote round, a meme submission and vote, a duel, a
+follow, the prize pool, 14 activity events) verified byte-identical
+after `migrate()`, then the v3 methods exercised (meme text stored,
+old v2 submissions read with null text and score, `record_ai_score`
+rejected from a non-judge account and for an out-of-range score,
+judge-recorded total 255 with its attestation hash, trading fee
+still accruing, copy buy still working). Only after that proof was
+the live arena migrated the same way, and its demo state was
+verified intact afterwards.
 
 ## Roadmap (not built)
 

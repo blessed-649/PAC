@@ -518,12 +518,18 @@ async function showCoin(id) {
         </div>
         <div class="panel">
           <h3>Daily meme ritual — day ${dayIdx}</h3>
+          <p class="muted small">An AI judge (NEAR AI Cloud, running in a TEE with attestation) scores each meme on humor, originality and relevance. The daily winner is picked 50% by the AI score and 50% by community votes, and wins 0.01 NEAR.</p>
           ${day && day.submissions.length ? day.submissions.map((s, i) => `
-            <div class="row" style="margin-top:6px;"><span class="mono">${esc(s.meme_hash)}</span><span class="muted small">by ${esc(s.submitter)} · ${s.votes} votes</span><button onclick="voteMeme(${coin.id}, ${dayIdx}, ${i})">Vote</button></div>`).join('')
+            <div style="margin-top:6px; border-top:1px solid #222; padding-top:6px;">
+              <div class="row"><span class="mono">${esc(s.meme_hash)}</span><span class="muted small">by ${esc(s.submitter)} · ${s.votes} votes</span><button onclick="voteMeme(${coin.id}, ${dayIdx}, ${i})">Vote</button></div>
+              ${s.meme_text ? `<div class="small" style="margin-top:4px;">${esc(s.meme_text)}</div>` : ''}
+              <div class="small muted" style="margin-top:4px;">AI judge: ${s.ai_score ? `humor ${s.ai_score.humor} · originality ${s.ai_score.originality} · relevance ${s.ai_score.relevance} · total ${s.ai_score.total}/300` : 'not scored yet'}</div>
+            </div>`).join('')
             : '<p class="muted small">No submissions today yet.</p>'}
-          <div class="row" style="margin-top:10px;"><input id="memeHash" placeholder="Meme hash (e.g. IPFS CID)" maxlength="128"><button onclick="submitMeme(${coin.id})">Submit meme</button></div>
+          <div class="row" style="margin-top:10px;"><input id="memeHash" placeholder="Meme hash (e.g. IPFS CID)" maxlength="128"><input id="memeText" placeholder="Meme text for the AI judge (optional, max 500 chars)" maxlength="500"><button onclick="submitMeme(${coin.id})">Submit meme</button></div>
+          <p class="muted small">The meme text is public and is what the AI judge reads. The hash alone cannot be scored.</p>
           <button style="margin-top:8px;" onclick="resolveMeme(${coin.id}, ${dayIdx})">Resolve today (after the day ends)</button>
-          ${day && day.resolved ? `<p class="small">Winner: <span class="mono">${esc(day.winner_hash || '')}</span> by ${esc(day.winner || '')}</p>` : ''}
+          ${day && day.resolved ? `<p class="small">Winner (AI 50% + community 50%): <span class="mono">${esc(day.winner_hash || '')}</span> by ${esc(day.winner || '')}</p>` : ''}
           <h3>Coin duel</h3>
           <p class="muted small">Challenge another coin to a 24h volume duel — loser pays 5% of its treasury.</p>
           <div class="row"><input id="duelOther" type="number" min="0" placeholder="Other coin id"><button onclick="createDuel(${coin.id})">Start duel</button></div>
@@ -731,7 +737,9 @@ async function submitMeme(coinId) {
   const me = requireWallet(); if (!me) return;
   const hash = $('memeHash').value.trim();
   if (!hash) { status('Enter a meme hash.'); return; }
-  try { await walletCall(ARENA_ID, 'submit_meme', { coin_id: coinId, meme_hash: hash }, 0n); status('Meme submitted for today.', 6000); setTimeout(() => showCoin(coinId), 3000); }
+  const text = $('memeText').value.trim() || null;
+  if (text && text.length > 500) { status('Meme text is over 500 characters.'); return; }
+  try { await walletCall(ARENA_ID, 'submit_meme', { coin_id: coinId, meme_hash: hash, meme_text: text }, 0n); status('Meme submitted for today.', 6000); setTimeout(() => showCoin(coinId), 3000); }
   catch (e) { status('Submit failed: ' + String(e.message).slice(0, 160), 9000); }
 }
 async function voteMeme(coinId, day, idx) {
