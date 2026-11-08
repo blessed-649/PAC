@@ -22,9 +22,10 @@ console.log(`redeploying ${wasm.length} bytes to ${ARENA_ID} ...`);
 await account.deployContract(wasm);
 console.log('WASM redeployed (state preserved)');
 const params = await account.viewFunction({ contractId: ARENA_ID, methodName: 'get_params', args: {} });
-if (params.lock_duration_hours !== 24 || params.battle_forfeit_yocto !== '100000000000000000000000') {
+if (params.lock_duration_hours !== 24 || params.battle_min_stake_yocto !== '100000000000000000000000') {
   throw new Error('params mismatch after redeploy');
 }
+console.log('schema_version after redeploy:', params.schema_version);
 const stats = await account.viewFunction({ contractId: ARENA_ID, methodName: 'get_stats', args: {} });
 console.log('get_stats after redeploy:', JSON.stringify(stats));
 console.log('REDEPLOY OK:', ARENA_ID);

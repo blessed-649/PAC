@@ -8,3 +8,4 @@ copy-relayer.config.json
 .copy-relayer-state.json
 agent-memory/
 .testnet-user-agent.json
+.testnet-judge-key.json

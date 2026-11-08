@@ -15,7 +15,25 @@ use near_contract_standards::storage_management::{
     StorageBalance, StorageBalanceBounds, StorageManagement,
 };
 use near_sdk::json_types::U128;
-use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, PromiseOrValue};
+// `serde_json` is not a dependency of this contract; cross-contract
+// calls use the ext_contract-generated ext_arena trait instead.
+use near_sdk::{
+    env, ext_contract, near, AccountId, Gas, NearToken, PanicOnDefault, PromiseOrValue,
+};
+
+/// The arena's transfer-sync method. Called after a plain transfer so
+/// the arena can reduce the sender's recorded curve position (H-03).
+/// The arena ignores calls from any account that is not a registered
+/// token contract, so this is a notification, not an authority grant.
+#[ext_contract(ext_arena)]
+pub trait ExtArena {
+    fn on_token_transfer(&mut self, sender_id: AccountId, receiver_id: AccountId, amount: U128);
+}
+
+/// Gas attached to the arena sync call. 10 TGas is ample for the
+/// position update; the call is fire-and-forget and its failure does
+/// not revert the transfer.
+const SYNC_GAS: Gas = Gas::from_tgas(10);
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
@@ -63,7 +81,22 @@ impl Contract {
 impl FungibleTokenCore for Contract {
     #[payable]
     fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>) {
-        self.token.ft_transfer(receiver_id, amount, memo)
+        let sender_id = env::predecessor_account_id();
+        self.token.ft_transfer(receiver_id.clone(), amount, memo);
+        // H-03: a plain transfer must sync holder accounting, or a
+        // wallet could transfer its tokens away and still vote, count
+        // as a qualified holder, and claim an airdrop on tokens it no
+        // longer holds. Notify the arena (fire-and-forget); the arena
+        // reduces the sender's recorded position. Transfers where the
+        // arena itself is the sender (buys, claims, airdrops, copy
+        // withdrawals) or the receiver (sells) are arena-originated
+        // and are already accounted for, so they are not notified.
+        if sender_id != self.owner && receiver_id != self.owner {
+            let owner = self.owner.clone();
+            let _ = ext_arena::ext(owner)
+                .with_static_gas(SYNC_GAS)
+                .on_token_transfer(sender_id, receiver_id.clone(), amount);
+        }
     }
 
     #[payable]
@@ -96,7 +129,16 @@ impl FungibleTokenResolver for Contract {
         amount: U128,
     ) -> U128 {
         let (used_amount, _) =
-            self.token.internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
+            self.token.internal_ft_resolve_transfer(&sender_id, receiver_id.clone(), amount);
+        // H-03: same sync as ft_transfer, for the amount actually
+        // used by an ft_transfer_call to a non-arena receiver. A call
+        // to the arena (a sell) is excluded: the arena is the receiver.
+        if used_amount > 0 && sender_id != self.owner && receiver_id != self.owner {
+            let owner = self.owner.clone();
+            let _ = ext_arena::ext(owner)
+                .with_static_gas(SYNC_GAS)
+                .on_token_transfer(sender_id, receiver_id, U128(used_amount));
+        }
         used_amount.into()
     }
 }

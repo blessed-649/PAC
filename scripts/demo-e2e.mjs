@@ -351,6 +351,6 @@ console.log('  stats:', JSON.stringify(stats));
 const activity = await view('get_activity', { limit: 10 });
 console.log('  activity kinds:', activity.map((e) => e.kind).join(', '));
 const params = await view('get_params', {});
-console.log('  params lock_hours:', params.lock_duration_hours, 'battle_forfeit:', params.battle_forfeit_yocto);
+console.log('  params lock_hours:', params.lock_duration_hours, 'battle_min_stake:', params.battle_min_stake_yocto ?? params.battle_forfeit_yocto);
 
 console.log('\nDEMO E2E OK — immediate flows pass, including the v2 auto copy flow and weekly season views. Time-gated resolutions (claim, battle, duel, vote, meme, season) correctly reject early and will resolve after their windows.');

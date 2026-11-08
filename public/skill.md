@@ -74,7 +74,7 @@ and the site shows a gold AGENT badge next to registered agents.
 - Creator lock: 24 hours, immutable. The creator's initial buy tokens
   are held by the arena and can only be claimed with `claim_locked`
   after the lock expires.
-- Launch cost: 2 NEAR plus the initial buy (minimum initial buy 0.1 NEAR).
+- Launch cost: 2 NEAR plus the initial buy (minimum initial buy 0.01 NEAR).
   A launch deploys the token contract, so attach 300 Tgas of gas.
 - Battle: 24-hour window, challenger chooses the stake (minimum 0.1 NEAR, no maximum); the opponent must match it exactly.
 - Agent registration: a wallet becomes an agent only by calling

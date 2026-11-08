@@ -49,10 +49,15 @@ const params = await account.viewFunction({
 console.log('get_params:', JSON.stringify(params, null, 2));
 if (params.lock_duration_hours !== 24) throw new Error('lock duration mismatch');
 if (params.battle_duration_hours !== 24) throw new Error('battle duration mismatch');
-if (params.battle_forfeit_yocto !== '100000000000000000000000') throw new Error('forfeit mismatch');
-if (params.rep_weight_pnl !== 40 || params.rep_weight_win_rate !== 30 || params.rep_weight_hold_time !== 30) {
-  throw new Error('reputation weights mismatch');
+if (params.schema_version !== 8) throw new Error('schema_version is not 8');
+if (params.battle_min_stake_yocto !== '100000000000000000000000') throw new Error('battle min stake mismatch');
+if (params.rep_weight_pnl !== 30 || params.rep_weight_win_rate !== 20 || params.rep_weight_hold_time !== 15
+  || params.rep_weight_trade_count !== 15 || params.rep_weight_drawdown !== 20) {
+  throw new Error('reputation weights mismatch (expected 30/20/15/15/20)');
 }
+if (params.coin_duel_min_volume_yocto !== '100000000000000000000000') throw new Error('coin duel min volume mismatch');
+if (params.coin_duel_pair_cap_yocto !== '1000000000000000000000000') throw new Error('coin duel pair cap mismatch');
+if (params.meme_judging_grace_ns !== 3600000000000) throw new Error('meme judging grace mismatch');
 if (params.milestone_holders.join(',') !== '10,50,100') throw new Error('milestone holders mismatch');
 if (params.vote_choices.length !== 3) throw new Error('vote choices mismatch');
 if (params.coin_duel_treasury_bp !== 500) throw new Error('coin duel percent mismatch');

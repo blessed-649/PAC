@@ -198,6 +198,10 @@ pub const VOTE_CHOICES: [&str; 3] = ["Burn 2% of supply", "Mint 2% of supply", "
 // its NEAR treasury (basis points, 500 = 5%) to the winner's treasury.
 pub const COIN_DUEL_DURATION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 pub const COIN_DUEL_TREASURY_BP: u128 = 500;
+// H-02: one active duel per coin pair, a meaningful minimum qualifying
+// volume, and a cap on aggregate treasury transfers per pair.
+pub const COIN_DUEL_MIN_VOLUME_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 NEAR
+pub const COIN_DUEL_PAIR_CAP_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
 
 // Daily meme ritual: one 24h day per coin, counted from its launch.
 pub const MEME_DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
@@ -205,6 +209,15 @@ pub const MEME_DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 pub const MEME_REWARD_YOCTO: u128 = 10_000_000_000_000_000_000_000;
 /// The treasury must hold at least this much NEAR for the reward to pay.
 pub const MEME_MIN_RESERVE_YOCTO: u128 = 50_000_000_000_000_000_000_000;
+// H-07a: a meme day may not resolve until the AI scores are in, or
+// until the fallback window has passed. Grace: 1 hour after day end;
+// fallback: 24 hours after day end, so a day the judge never scores
+// is not stuck forever.
+pub const MEME_JUDGING_GRACE_NS: u64 = 3_600_000_000_000;
+pub const MEME_JUDGING_FALLBACK_NS: u64 = 86_400_000_000_000;
+pub const MAX_MEME_SUBMISSIONS_PER_DAY: usize = 100;
+pub const MAX_FOLLOWERS_PER_LEADER: usize = 1000;
+pub const MAX_COPY_PUBLIC_KEY_LEN: usize = 128;
 /// Max meme text length (chars) the AI judge reads. The text is public:
 /// a meme is meant to be seen, so it is stored onchain in the clear.
 pub const MEME_TEXT_MAX_CHARS: usize = 500;
@@ -226,9 +239,13 @@ pub const ATTESTATION_HASH_MAX_CHARS: usize = 128;
 // ---------------------------------------------------------------------------
 
 /// Trading fee on every buy and sell, basis points (100 = 1%). The fee
-/// goes to the weekly prize pool; it is taken from the amount that would
-/// otherwise enter the coin's NEAR reserve, so the buyer gets the same
-/// tokens for the same curve cost.
+/// goes to the weekly prize pool and is taken out of the amount the
+/// trader attaches (buys) or out of the gross proceeds (sells). The
+/// FULL curve cost enters the coin's NEAR reserve on a buy, and a sell
+/// pays out the full gross proceeds from the reserve, so the reserve
+/// always covers redemption: a sole buyer can sell its whole position
+/// back. (v8: the old model took the buy fee out of the reserve, so the
+/// reserve was 1% short of the redemption obligation on every buy.)
 pub const TRADING_FEE_BP: u128 = 100;
 /// Copy fee on every copy trade, basis points (100 = 1%), paid to the
 /// leader. Taken from the copy amount: a 1 NEAR copy buys 0.99 NEAR of
@@ -338,6 +355,17 @@ pub struct AgentRep {
     pub peak_realised_yocto: i128,
     /// Largest peak-to-trough decline in realised PnL since v5, yoctoNEAR.
     pub max_drawdown_yocto: u128,
+}
+
+/// A purchase lot: one buy's tokens, its curve cost, and when it was
+/// bought. Holding time is tracked per lot (H-07e) instead of a single
+/// `first_buy_ns` inherited by every later buy, and a transfer out
+/// consumes lots so the recorded position follows the tokens (H-03).
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
+pub struct Lot {
+    pub tokens: u128,      // whole tokens
+    pub spent_yocto: u128, // curve cost of these tokens
+    pub bought_ns: u64,
 }
 
 /// One agent's open position in one coin (cost basis for win rate and PnL).
@@ -512,8 +540,11 @@ pub struct CopyPosition {
 }
 
 /// One weekly season. `agents` is the set of agents with a season PnL
-/// entry; the pool is the prize pool at the last fee of the season
-/// (for a resolved season, the pool it distributed from).
+/// entry; the pool is this season's OWN allocation: the rollover
+/// carried in from the previous resolved season plus the trading
+/// fees that accrued while this season was current (for a resolved
+/// season, the pool it distributed from). It is never the live
+/// prize pool, which also holds other seasons' fees.
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 pub struct Season {
     pub id: u64,
@@ -575,6 +606,8 @@ pub struct ParamsView {
     pub vote_max_duration_hours: u64,
     pub coin_duel_duration_hours: u64,
     pub coin_duel_treasury_bp: u128,
+    pub coin_duel_min_volume_yocto: String,
+    pub coin_duel_pair_cap_yocto: String,
     pub meme_day_hours: u64,
     pub meme_reward_yocto: String,
     pub meme_min_reserve_yocto: String,
@@ -596,9 +629,11 @@ pub struct ParamsView {
     pub season_duration_ns: u64,
     pub season_duration_days: u64,
     pub season_top_shares_bp: Vec<u128>,
-    /// Contract schema version (v7). Lets anyone confirm which
+    /// Contract schema version (v8). Lets anyone confirm which
     /// contract code is live without reading the WASM.
     pub schema_version: u32,
+    /// Meme judging grace period, nanoseconds (v8).
+    pub meme_judging_grace_ns: u64,
     /// Agent registration is live (v7): a wallet becomes an agent only
     /// by calling register_agent; get_agent returns is_agent.
     pub agent_registration_enabled: bool,
@@ -738,6 +773,8 @@ pub struct MemeDayView {
     pub resolved: bool,
     pub winner_hash: Option<String>,
     pub winner: Option<AccountId>,
+    /// True when every text submission on the day has an AI score.
+    pub judging_complete: bool,
 }
 
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
@@ -1018,6 +1055,28 @@ pub fn fee_yocto(amount: u128, bp: u128) -> u128 {
     amount * bp / 10_000
 }
 
+/// NEAR available for the curve cost when `attached` is the total a
+/// trader spends, including the 1% trading fee: attached * 100 / 101.
+/// The fee on the resulting cost is at most attached / 101, so
+/// cost + fee <= attached always (integer floors only shrink both).
+pub fn fee_adjusted_spendable(attached: u128) -> u128 {
+    attached * 100 / 101
+}
+
+/// Split an attached buy amount into (tokens, curve cost, trading
+/// fee) at the given sold count. The full curve cost enters the
+/// coin's reserve and the fee goes to the prize pool, so the reserve
+/// always covers redemption: a sole buyer can sell its whole
+/// position back (gross proceeds == curve cost <= reserve), netting
+/// 99% after the sell-side fee. Pure, so the round-trip invariant
+/// is unit-testable without a chain.
+pub fn buy_with_fee(from_sold: u128, attached: u128, max_tokens: u128) -> (u128, u128, u128) {
+    let spendable = fee_adjusted_spendable(attached);
+    let (tokens, cost) = buy_tokens_for_near(from_sold, spendable, max_tokens);
+    let fee = fee_yocto(cost, TRADING_FEE_BP);
+    (tokens, cost, fee)
+}
+
 /// Copy amounts are valid when the per-trade amount is within
 /// [0.01, 10] NEAR and the max total is at least 0.1 NEAR.
 pub fn copy_amounts_valid(amount_per_trade_yocto: u128, max_total_yocto: u128) -> bool {
@@ -1072,6 +1131,16 @@ pub fn season_start_ns(season_id: u64) -> u64 {
 
 pub fn season_end_ns(season_id: u64) -> u64 {
     season_start_ns(season_id) + SEASON_DURATION_NS
+}
+
+/// Key for the aggregate duel transfer cap: the unordered coin pair,
+/// lower id first, so a:b and b:a share one cap.
+pub fn duel_pair_key(a: u64, b: u64) -> String {
+    if a <= b {
+        format!("{}:{}", a, b)
+    } else {
+        format!("{}:{}", b, a)
+    }
 }
 
 /// Split a season pool across the ranked agents (already sorted best
@@ -1132,6 +1201,7 @@ pub trait ExtSelf {
         buyer: AccountId,
         tokens: U128,
         cost_yocto: U128,
+        fee_yocto_: U128,
         attached_yocto: U128,
     ) -> PromiseOrValue<bool>;
     fn on_claim(&mut self, coin_id: u64, creator: AccountId, tokens: U128) -> bool;
@@ -1171,9 +1241,11 @@ pub struct Contract {
     meme_days: LookupMap<String, MemeDay>,
     // --- v2 fields (appended after the v1 fields, so the v1 Borsh
     // layout is preserved and migrate() can copy the old state) ---
-    /// Live prize pool for the current weekly season (yoctoNEAR).
-    /// Trading fees accrue here; resolve_season pays winners from it
-    /// and the undistributed share stays here as rollover.
+    /// Live prize pool (yoctoNEAR): the sum of every season's
+    /// allocation minus payouts. Trading fees accrue here and in the
+    /// current season's own pool; resolve_season pays winners from
+    /// it and the undistributed share of the resolved season becomes
+    /// rollover_yocto for the next season.
     prize_pool_yocto: u128,
     /// "copier:leader" -> Follow.
     follows: LookupMap<String, Follow>,
@@ -1200,14 +1272,10 @@ pub struct Contract {
     /// AgentStats map deserialises unchanged. Starts empty at v5.
     agent_rep: LookupMap<AccountId, AgentRep>,
     // --- v6 field (appended after the v5 fields) ---
-    /// Contract schema version. Set to 7 by new() and by migrate().
-    /// migrate() requires the old state's schema_version to be 6,
-    /// so a second migrate() on v7 state (schema_version 7) panics
-    /// instead of silently re-copying the state. (The Borsh
-    /// trailing-bytes guard from v6 does not apply here, because the
-    /// v6 and v7 layouts are identical — both carry this field — so
-    /// the explicit version check in migrate() is what makes it
-    /// one-shot.)
+    /// Contract schema version. Set to 8 by new() and by migrate().
+    /// migrate() requires the old state's schema_version to be 7,
+    /// so a second migrate() on v8 state (schema_version 8) panics
+    /// instead of silently re-copying the state.
     schema_version: u32,
     // --- v7 field (appended after schema_version) ---
     /// Registered agents (v7): the set of accounts that called
@@ -1217,6 +1285,26 @@ pub struct Contract {
     /// deserialising unchanged. Starts empty at v7; every existing
     /// account reads back is_agent=false until it registers.
     registered_agents: LookupSet<AccountId>,
+    // --- v8 fields (appended after the v7 fields) ---
+    /// Undistributed prize-pool NEAR carried forward between seasons
+    /// (H-05). This is the ONLY amount a future season may add to its
+    /// own fees; the live prize pool ledger is never re-snapshotted
+    /// wholesale, so two overlapping seasons cannot pay the same
+    /// NEAR twice.
+    rollover_yocto: u128,
+    /// Cumulative treasury NEAR paid out in coin duels per unordered
+    /// coin pair, keyed "a:b" with a <= b (H-02 cap).
+    duel_transfers: LookupMap<String, u128>,
+    /// Purchase lots per position, keyed like positions ("agent:coin")
+    /// (H-07e holding time, H-03 transfer-out accounting).
+    position_lots: LookupMap<String, Vec<Lot>>,
+    /// Meme days whose AI judging is complete, keyed "coin_id:day"
+    /// (H-07a). A day may resolve only when it is in this set or the
+    /// fallback window has passed.
+    judging_complete: LookupSet<String>,
+    /// Ring-buffer head for `activity` (v8): the physical index of
+    /// the oldest event once the feed is full (500 events).
+    activity_head: u32,
 }
 
 /// The v6 coin record, kept verbatim so migrate() can deserialise the
@@ -1254,16 +1342,17 @@ pub struct OldCoin {
     pub image_url: Option<String>,
 }
 
-/// The v6 contract state, kept verbatim so migrate() can deserialise
-/// the live v6 bytes and rebuild the v7 state from them. Field order
-/// and types must match the v6 Contract exactly; do not edit. The
-/// coins map holds OldCoin records (see above) because the v6 Coin
-/// adds qualified_holders. The v6 Contract adds agent_rep at the end,
-/// then schema_version. The v7 Contract adds one field after
-/// schema_version (registered_agents, the v7 agent-registration set,
-/// which starts empty), so migrate() is a straight copy of every v6
-/// field and collection plus a fresh empty registration set.
-#[derive(BorshDeserialize)]
+/// The v7 contract state, kept verbatim so migrate() can deserialise
+/// the live v7 bytes and rebuild the v8 state from them. Field order
+/// and types must match the v7 Contract exactly; do not edit. The
+/// coins map holds OldCoin records (see above) because the v7 Coin is
+/// identical to the v6 Coin. The v7 Contract adds registered_agents
+/// after schema_version. The v8 Contract adds four fields after
+/// registered_agents (rollover_yocto, duel_transfers, position_lots,
+/// judging_complete), all fresh at migrate time, so migrate() is a
+/// straight copy of every v7 field and collection plus fresh v8
+/// collections.
+#[derive(BorshSerialize, BorshDeserialize)]
 pub struct OldContract {
     coin_count: u64,
     battle_count: u64,
@@ -1294,10 +1383,12 @@ pub struct OldContract {
     /// Per-agent reputation extension (v6): realised PnL, peak, max
     /// drawdown (same position as in the v6 Contract).
     agent_rep: LookupMap<AccountId, AgentRep>,
-    /// Contract schema version (v6 field; same position as in the v6
-    /// Contract). migrate() requires this to be 6, so a second
-    /// migrate() on v7 state (schema_version 7) is rejected.
+    /// Contract schema version. v7 state carries 7 here; migrate()
+    /// requires exactly 7, so a second migrate() on v8 state
+    /// (schema_version 8) is rejected.
     schema_version: u32,
+    /// Registered agents (v7 field, appended after schema_version).
+    registered_agents: LookupSet<AccountId>,
 }
 
 #[near]
@@ -1328,79 +1419,70 @@ impl Contract {
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
-            schema_version: 7,
+            schema_version: 8,
             registered_agents: LookupSet::new(b"g"),
+            rollover_yocto: 0,
+            duel_transfers: LookupMap::new(b"u"),
+            position_lots: LookupMap::new(b"l"),
+            judging_complete: LookupSet::new(b"q"),
+            activity_head: 0,
         }
     }
 
-    /// Migrate the live v6 state to v7 without wiping it. Deploy the
-    /// v7 WASM over the v6 contract, then call this once. It reads the
-    /// old state as OldContract, copies every v6 field and collection
-    /// verbatim (agents, positions, battles, vote rounds, coin duels,
-    /// meme days, meme texts, AI scores, activity, prize pool, follows,
-    /// copy positions, seasons, agent_rep), and rebuilds each coin as
-    /// a v7 Coin field for field, including its stored qualified
-    /// holder count. The v7 Coin is identical to the v6 Coin, so the
-    /// coins are a straight copy field for field. The v7 Contract adds
-    /// one field after schema_version: registered_agents, the
-    /// agent-registration set, which starts empty (every existing
-    /// account reads back is_agent=false until it calls
-    /// register_agent). The other v7 changes are the battle stake
-    /// model (fixed 0.1 NEAR forfeit -> the two agents decide the
-    /// stake, minimum 0.1 NEAR; logic only) and the registration
-    /// method itself. Existing battles keep their stored 0.1
-    /// NEAR stake; only new battles use the agents-decide model. Coin ids are
-    /// sequential from 0, so the rebuild walks 0..coin_count and
-    /// skips ids with no stored coin (a failed launch leaves a gap).
-    /// The new coins map reuses the same storage prefix, so each
-    /// converted coin overwrites its old bytes at the same key. NOTE:
-    /// set(), not insert(). insert() loads the previous value at the
-    /// key so it can return it; set() only marks the cache entry
-    /// modified, so the v7 bytes overwrite the v6 bytes at the same
-    /// key on flush. Calling migrate() twice fails: migrate() requires
-    /// the old state's schema_version to be 6, and after the first
-    /// call the stored state is v7 (schema_version 7), so the second
-    /// call panics. (The Borsh trailing-bytes guard from v6 applies
-    /// again here, because the v7 layout appends registered_agents
-    /// after schema_version: reading v7 state as OldContract fails on
-    /// the trailing bytes, and the explicit version check also rejects
-    /// it, so migrate() is one-shot on both counts.)
+    /// Migrate the live v7 state to v8 without wiping it. Deploy the
+    /// v8 WASM over the v7 contract, then call this once. It reads the
+    /// old state as OldContract and copies every v7 field and
+    /// collection verbatim (coins, agents, positions, battles, vote
+    /// rounds, coin duels, meme days, meme texts, AI scores, activity,
+    /// prize pool, follows, copy positions, seasons, agent_rep,
+    /// registered agents). The v8 Coin is identical to the v7 Coin, so
+    /// each coin is copied field for field with no other change. The
+    /// v8 Contract adds four fields after registered_agents
+    /// (rollover_yocto, duel_transfers, position_lots,
+    /// judging_complete) plus the activity ring head, all fresh at
+    /// migrate time. Calling migrate() twice fails: migrate() requires
+    /// the old state's schema_version to be 7, and after the first call
+    /// the stored state is v8 (schema_version 8), so the second call
+    /// panics.
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v6 state to migrate");
+        let old: OldContract = env::state_read().expect("no v7 state to migrate");
         assert_eq!(
-            old.schema_version, 6,
-            "migrate() only runs on v6 state (schema_version 6); this state is already v7 or another version"
+            old.schema_version, 7,
+            "migrate() only runs on v7 state (schema_version 7); this state is already v8 or another version"
         );
         let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
         for id in 0..old.coin_count {
-            if let Some(oc) = old.coins.get(&id).cloned() {
-                coins.set(id, Some(Coin {
-                    id: oc.id,
-                    token_id: oc.token_id,
-                    name: oc.name,
-                    symbol: oc.symbol,
-                    description: oc.description,
-                    creator: oc.creator,
-                    created_at_ns: oc.created_at_ns,
-                    sold_tokens: oc.sold_tokens,
-                    locked_tokens: oc.locked_tokens,
-                    initial_buy_tokens: oc.initial_buy_tokens,
-                    unlock_at_ns: oc.unlock_at_ns,
-                    creator_sold_after_unlock: oc.creator_sold_after_unlock,
-                    near_reserve_yocto: oc.near_reserve_yocto,
-                    total_spent_yocto: oc.total_spent_yocto,
-                    total_received_yocto: oc.total_received_yocto,
-                    total_supply_tokens: oc.total_supply_tokens,
-                    curve_cap_tokens: oc.curve_cap_tokens,
-                    burned_tokens: oc.burned_tokens,
-                    milestones_fired: oc.milestones_fired,
-                    airdrop_per_holder: oc.airdrop_per_holder,
-                    airdrop_claimed: oc.airdrop_claimed,
-                    holders: oc.holders,
-                    qualified_holders: oc.qualified_holders,
-                    image_url: oc.image_url,
-                }));
+            if let Some(oc) = old.coins.get(&id) {
+                coins.insert(
+                    id,
+                    Coin {
+                        id: oc.id,
+                        token_id: oc.token_id.clone(),
+                        name: oc.name.clone(),
+                        symbol: oc.symbol.clone(),
+                        description: oc.description.clone(),
+                        creator: oc.creator.clone(),
+                        created_at_ns: oc.created_at_ns,
+                        sold_tokens: oc.sold_tokens,
+                        locked_tokens: oc.locked_tokens,
+                        initial_buy_tokens: oc.initial_buy_tokens,
+                        unlock_at_ns: oc.unlock_at_ns,
+                        creator_sold_after_unlock: oc.creator_sold_after_unlock,
+                        near_reserve_yocto: oc.near_reserve_yocto,
+                        total_spent_yocto: oc.total_spent_yocto,
+                        total_received_yocto: oc.total_received_yocto,
+                        total_supply_tokens: oc.total_supply_tokens,
+                        curve_cap_tokens: oc.curve_cap_tokens,
+                        burned_tokens: oc.burned_tokens,
+                        milestones_fired: oc.milestones_fired.clone(),
+                        airdrop_per_holder: oc.airdrop_per_holder,
+                        airdrop_claimed: oc.airdrop_claimed.clone(),
+                        holders: oc.holders.clone(),
+                        qualified_holders: oc.qualified_holders,
+                        image_url: oc.image_url.clone(),
+                    },
+                );
             }
         }
         Self {
@@ -1427,8 +1509,13 @@ impl Contract {
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
             agent_rep: old.agent_rep,
-            schema_version: 7,
-            registered_agents: LookupSet::new(b"g"),
+            schema_version: 8,
+            registered_agents: old.registered_agents,
+            rollover_yocto: 0,
+            duel_transfers: LookupMap::new(b"u"),
+            position_lots: LookupMap::new(b"l"),
+            judging_complete: LookupSet::new(b"q"),
+            activity_head: 0,
         }
     }
 
@@ -1445,6 +1532,65 @@ impl Contract {
 
     fn position_key(agent: &AccountId, coin_id: u64) -> String {
         format!("{}:{}", agent, coin_id)
+    }
+
+    /// Record one buy as a purchase lot for holding-time and
+    /// transfer accounting (H-07e, H-03).
+    fn add_lot(&mut self, agent: &AccountId, coin_id: u64, tokens: u128, spent_yocto: u128, now: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let key = Self::position_key(agent, coin_id);
+        let mut lots = self.position_lots.get(&key).cloned().unwrap_or_default();
+        lots.push(Lot { tokens, spent_yocto, bought_ns: now });
+        self.position_lots.insert(key, lots);
+    }
+
+    /// Consume `tokens` from a position's lots, most recent first
+    /// (matching the curve, which sells the most recent tokens
+    /// first). Returns (spent removed, token-weighted average hold
+    /// time in ns, tokens actually consumed from lots). Returns
+    /// None when the position has no recorded lots at all (a
+    /// pre-v8 position): the caller falls back to average cost and
+    /// the single first_buy_ns hold time.
+    fn consume_lots(
+        &mut self,
+        agent: &AccountId,
+        coin_id: u64,
+        mut tokens: u128,
+        now: u64,
+    ) -> Option<(u128, u128, u128)> {
+        let key = Self::position_key(agent, coin_id);
+        let mut lots = self.position_lots.get(&key).cloned().unwrap_or_default();
+        if lots.is_empty() {
+            return None;
+        }
+        let mut spent = 0u128;
+        let mut weighted_age = 0u128;
+        let mut consumed = 0u128;
+        while tokens > 0 {
+            let Some(lot) = lots.last_mut() else { break };
+            let take = tokens.min(lot.tokens);
+            let lot_spent = if take == lot.tokens {
+                lot.spent_yocto
+            } else {
+                lot.spent_yocto * take / lot.tokens
+            };
+            spent += lot_spent;
+            weighted_age += take * (now.saturating_sub(lot.bought_ns) as u128);
+            consumed += take;
+            lot.tokens -= take;
+            lot.spent_yocto -= lot_spent;
+            if lot.tokens == 0 {
+                lots.pop();
+            }
+            tokens -= take;
+        }
+        if consumed == 0 {
+            return None;
+        }
+        self.position_lots.insert(key, lots);
+        Some((spent, weighted_age / consumed, consumed))
     }
 
     fn get_agent_stats(&self, agent: &AccountId) -> AgentStats {
@@ -1483,11 +1629,26 @@ impl Contract {
         bought_tokens >= MIN_QUALIFIED_HOLDING_TOKENS
     }
 
-    fn record_event(&mut self, kind: &str, agent: AccountId, coin_id: u64, tokens: u128, near: u128, note: String) {
-        if self.activity.len() >= 500 {
-            return;
+    /// Physical index of the logical activity position `i` (0 =
+    /// oldest) in the ring buffer.
+    fn activity_at(&self, i: u32) -> Option<TradeEvent> {
+        let n = self.activity.len();
+        if n == 0 || i >= n {
+            return None;
         }
-        self.activity.push(TradeEvent {
+        let physical = if n < 500 {
+            i
+        } else {
+            (self.activity_head + i) % 500
+        };
+        self.activity.get(physical).cloned()
+    }
+
+    fn record_event(&mut self, kind: &str, agent: AccountId, coin_id: u64, tokens: u128, near: u128, note: String) {
+        // Ring buffer: once the feed holds 500 events, overwrite the
+        // oldest instead of silently discarding new ones, so the live
+        // feed always shows the newest activity.
+        let event = TradeEvent {
             kind: kind.to_string(),
             agent,
             coin_id,
@@ -1495,7 +1656,13 @@ impl Contract {
             near_yocto: near.to_string(),
             timestamp_ns: env::block_timestamp(),
             note,
-        });
+        };
+        if self.activity.len() < 500 {
+            self.activity.push(event);
+        } else {
+            self.activity.set(self.activity_head, event);
+            self.activity_head = (self.activity_head + 1) % 500;
+        }
     }
 
     fn coin_view(&self, coin: &Coin) -> CoinView {
@@ -1616,7 +1783,10 @@ impl Contract {
             attached >= initial_buy_yocto.0 + LAUNCH_COST_YOCTO,
             "attach initial buy + 2 NEAR launch cost"
         );
-        let (tokens, cost) = buy_tokens_for_near(0, initial_buy_yocto.0, MAX_CURVE_TOKENS);
+        // The initial buy is the total the creator spends on tokens,
+        // including the 1% trading fee; the full curve cost enters the
+        // reserve (see buy_with_fee).
+        let (tokens, cost, _fee) = buy_with_fee(0, initial_buy_yocto.0, MAX_CURVE_TOKENS);
         assert!(tokens > 0, "initial buy buys zero tokens");
 
         let coin_id = self.coin_count;
@@ -1688,10 +1858,19 @@ impl Contract {
             PromiseResult::Successful(_) => {
                 let now = env::block_timestamp();
                 // The initial buy pays the 1% trading fee like any buy:
-                // the fee goes to the weekly prize pool and the coin
-                // reserve grows by cost minus fee.
+                // the fee goes to the weekly prize pool and the FULL
+                // curve cost enters the reserve, so the reserve always
+                // covers redemption. Any attached NEAR above
+                // cost + fee + launch cost is excess and is refunded.
                 let launch_fee = fee_yocto(cost_yocto.0, TRADING_FEE_BP);
                 self.record_trading_fee(launch_fee);
+                let excess = attached_yocto
+                    .0
+                    .saturating_sub(cost_yocto.0 + launch_fee + LAUNCH_COST_YOCTO);
+                if excess > 0 {
+                    Promise::new(creator.clone())
+                        .transfer(NearToken::from_yoctonear(excess));
+                }
                 let coin = Coin {
                     id: coin_id,
                     token_id: token_id.clone(),
@@ -1705,7 +1884,7 @@ impl Contract {
                     initial_buy_tokens: tokens.0,
                     unlock_at_ns: now + LOCK_DURATION_NS,
                     creator_sold_after_unlock: 0,
-                    near_reserve_yocto: cost_yocto.0 - launch_fee,
+                    near_reserve_yocto: cost_yocto.0,
                     total_spent_yocto: cost_yocto.0,
                     total_received_yocto: 0,
                     total_supply_tokens: TOTAL_SUPPLY_TOKENS,
@@ -1729,7 +1908,7 @@ impl Contract {
                 // The creator's initial buy is a position with cost basis.
                 let key = Self::position_key(&creator, coin_id);
                 self.positions.insert(
-                    key,
+                    key.clone(),
                     Position {
                         bought_tokens: tokens.0,
                         spent_yocto: cost_yocto.0,
@@ -1737,6 +1916,7 @@ impl Contract {
                         realised_yocto: 0,
                     },
                 );
+                self.add_lot(&creator, coin_id, tokens.0, cost_yocto.0, now);
                 self.track_agent(&creator);
                 let mut stats = self.get_agent_stats(&creator);
                 stats.total_spent_yocto += cost_yocto.0;
@@ -1786,7 +1966,9 @@ impl Contract {
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
         assert!(coin.sold_tokens < coin.curve_cap_tokens, "curve sold out");
         let max_tokens = coin.curve_cap_tokens - coin.sold_tokens;
-        let (tokens, cost) = buy_tokens_for_near(coin.sold_tokens, attached, max_tokens);
+        // The attached amount is the total spend including the 1%
+        // trading fee; the full curve cost enters the reserve.
+        let (tokens, cost, fee) = buy_with_fee(coin.sold_tokens, attached, max_tokens);
         assert!(tokens > 0, "amount buys zero tokens");
         // Optimistic sold update so two quick buys cannot oversell the curve.
         coin.sold_tokens += tokens;
@@ -1799,7 +1981,7 @@ impl Contract {
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(40))
-                    .on_buy(coin_id, buyer, U128(tokens), U128(cost), U128(attached)),
+                    .on_buy(coin_id, buyer, U128(tokens), U128(cost), U128(fee), U128(attached)),
             );
         U128(tokens)
     }
@@ -1813,17 +1995,19 @@ impl Contract {
         buyer: AccountId,
         tokens: U128,
         cost_yocto: U128,
+        fee_yocto_: U128,
         attached_yocto: U128,
     ) -> PromiseOrValue<bool> {
         match env::promise_result(0) {
             PromiseResult::Successful(_) => {
                 let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
-                // 1% trading fee to the weekly prize pool, taken from
-                // the amount that would otherwise enter the reserve.
-                // The buyer still gets the same tokens for the same cost.
-                let trade_fee = fee_yocto(cost_yocto.0, TRADING_FEE_BP);
+                // 1% trading fee to the weekly prize pool. It was
+                // taken out of the attached amount up front (see
+                // buy_with_fee), so the FULL curve cost enters the
+                // reserve and the reserve always covers redemption.
+                let trade_fee = fee_yocto_.0;
                 self.record_trading_fee(trade_fee);
-                coin.near_reserve_yocto += cost_yocto.0 - trade_fee;
+                coin.near_reserve_yocto += cost_yocto.0;
                 coin.total_spent_yocto += cost_yocto.0;
                 if !coin.holders.contains(&buyer) {
                     coin.holders.push(buyer.clone());
@@ -1844,7 +2028,8 @@ impl Contract {
                     coin.qualified_holders += 1;
                 }
                 self.coins.insert(coin_id, coin);
-                self.positions.insert(key, pos);
+                self.positions.insert(key.clone(), pos);
+                self.add_lot(&buyer, coin_id, tokens.0, cost_yocto.0, env::block_timestamp());
                 self.track_agent(&buyer);
                 let mut stats = self.get_agent_stats(&buyer);
                 stats.total_spent_yocto += cost_yocto.0;
@@ -1857,9 +2042,9 @@ impl Contract {
                     cost_yocto.0,
                     "bought on the curve".to_string(),
                 );
-                if attached_yocto.0 > cost_yocto.0 {
-                    Promise::new(buyer)
-                        .transfer(NearToken::from_yoctonear(attached_yocto.0 - cost_yocto.0));
+                let refund = attached_yocto.0.saturating_sub(cost_yocto.0 + trade_fee);
+                if refund > 0 {
+                    Promise::new(buyer).transfer(NearToken::from_yoctonear(refund));
                 }
                 // Holder milestones fire automatically when the
                 // qualified holder count crosses 10 / 50 / 100. The
@@ -2073,6 +2258,83 @@ impl Contract {
             );
     }
 
+    /// Sync holder accounting after a plain token transfer (H-03).
+    /// Called by a coin's token contract from ft_transfer /
+    /// ft_resolve_transfer whenever tokens move between two wallets
+    /// that are neither the arena nor the token contract itself.
+    /// Only the token contract of a known coin may call it (the
+    /// predecessor must be a registered token id); any other caller
+    /// is ignored. A transfer out reduces the sender's recorded
+    /// curve position (and its qualified status) by the amount
+    /// moved, consuming purchase lots most-recent-first. A transfer
+    /// in creates NO curve position, so transferred tokens never
+    /// qualify, vote, or claim: qualification is by curve-bought
+    /// position, not token balance. The sale of transferred tokens
+    /// still pays out (see ft_on_transfer), but with no cost basis
+    /// for the transferred part.
+    pub fn on_token_transfer(
+        &mut self,
+        sender_id: AccountId,
+        receiver_id: AccountId,
+        amount: U128,
+    ) {
+        let token_id = env::predecessor_account_id();
+        let coin_id = match self.token_to_coin.get(&token_id) {
+            Some(id) => *id,
+            None => return,
+        };
+        let whole_tokens = amount.0 / DECIMAL_MULT;
+        if whole_tokens == 0 {
+            return;
+        }
+        let key = Self::position_key(&sender_id, coin_id);
+        let mut pos = match self.positions.get(&key) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        if pos.bought_tokens == 0 {
+            return;
+        }
+        let was_qualified = Self::is_qualified_holding(pos.bought_tokens);
+        let moved = whole_tokens.min(pos.bought_tokens);
+        let cost_removed = match self.consume_lots(
+            &sender_id,
+            coin_id,
+            moved,
+            env::block_timestamp(),
+        ) {
+            Some((spent, _hold, consumed)) => {
+                let mut cost = spent;
+                if consumed < moved {
+                    let rest = moved - consumed;
+                    cost += rest * (pos.spent_yocto / pos.bought_tokens);
+                }
+                cost.min(pos.spent_yocto)
+            }
+            None => moved * (pos.spent_yocto / pos.bought_tokens),
+        };
+        pos.bought_tokens -= moved;
+        pos.spent_yocto = pos.spent_yocto.saturating_sub(cost_removed);
+        if pos.bought_tokens == 0 {
+            pos.first_buy_ns = 0;
+        }
+        let dropped_below = was_qualified && !Self::is_qualified_holding(pos.bought_tokens);
+        self.positions.insert(key, pos);
+        if dropped_below {
+            let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
+            coin.qualified_holders = coin.qualified_holders.saturating_sub(1);
+            self.coins.insert(coin_id, coin);
+        }
+        self.record_event(
+            "transfer",
+            sender_id,
+            coin_id,
+            moved,
+            0,
+            format!("plain transfer of {} tokens to {}", moved, receiver_id),
+        );
+    }
+
     /// Callback after the locked-token transfer. Restores the lock on failure.
     #[private]
     pub fn on_claim(&mut self, coin_id: u64, creator: AccountId, tokens: U128) -> bool {
@@ -2108,6 +2370,16 @@ impl Contract {
         let challenger = env::predecessor_account_id();
         assert!(self.coins.get(&coin_id).is_some(), "coin not found");
         assert_ne!(challenger, opponent, "cannot battle yourself");
+        // Battles are agent battles (v7 design): both sides must be
+        // registered agents. Trading alone never registers an account.
+        assert!(
+            self.registered_agents.contains(&challenger),
+            "only registered agents create battles"
+        );
+        assert!(
+            self.registered_agents.contains(&opponent),
+            "opponent must be a registered agent"
+        );
         let stake = env::attached_deposit().as_yoctonear();
         assert!(
             stake >= BATTLE_MIN_STAKE_YOCTO,
@@ -2152,6 +2424,10 @@ impl Contract {
         let mut battle = self.battles.get(&battle_id).expect("battle not found").clone();
         assert_eq!(battle.status, 0, "battle not pending");
         assert_eq!(caller, battle.agent_b, "only the challenged agent accepts");
+        assert!(
+            self.registered_agents.contains(&caller),
+            "only registered agents accept battles"
+        );
         assert_eq!(
             env::attached_deposit().as_yoctonear(),
             battle.forfeit_yocto,
@@ -2298,9 +2574,12 @@ impl Contract {
         season_id_for(env::block_timestamp())
     }
 
-    /// Create the current season's record if it has none yet. A new
-    /// record starts with the live prize pool, so rollover from the
-    /// previous season is already inside it.
+    /// Create a season's record if it has none yet. A new record
+    /// starts with ONLY the actual undistributed rollover from the
+    /// previous resolved season (H-05): it must never snapshot the
+    /// live prize pool, because that pool also holds fees that belong
+    /// to other (already recorded or future) seasons, and two seasons
+    /// would then pay the same NEAR twice.
     fn ensure_season(&mut self, season_id: u64) -> Season {
         if let Some(s) = self.seasons.get(&season_id) {
             return s.clone();
@@ -2309,7 +2588,7 @@ impl Contract {
             id: season_id,
             start_ns: season_start_ns(season_id),
             end_ns: season_end_ns(season_id),
-            pool_yocto: self.prize_pool_yocto,
+            pool_yocto: self.rollover_yocto,
             status: 0,
             winners: vec![],
             payouts_yocto: vec![],
@@ -2319,8 +2598,10 @@ impl Contract {
         s
     }
 
-    /// Route a 1% trading fee to the weekly prize pool and keep the
-    /// current season record's pool in step with the live pool.
+    /// Route a 1% trading fee to the weekly prize pool and add it to
+    /// the current season's own allocation only. The live pool is the
+    /// sum of every season's allocation minus payouts; no season ever
+    /// re-reads the live pool as its own.
     fn record_trading_fee(&mut self, fee_yocto: u128) {
         if fee_yocto == 0 {
             return;
@@ -2328,7 +2609,7 @@ impl Contract {
         self.prize_pool_yocto += fee_yocto;
         let season_id = self.current_season_id();
         let mut season = self.ensure_season(season_id);
-        season.pool_yocto = self.prize_pool_yocto;
+        season.pool_yocto += fee_yocto;
         self.seasons.insert(season_id, season);
     }
 
@@ -2580,6 +2861,27 @@ impl Contract {
         assert!(self.coins.get(&coin_a).is_some(), "coin A not found");
         assert!(self.coins.get(&coin_b).is_some(), "coin B not found");
         assert_ne!(coin_a, coin_b, "a coin cannot duel itself");
+        // One active duel per coin pair: without this, an attacker
+        // could open many duels between the same two coins and drain
+        // 5% of the loser's treasury per resolve.
+        for id in 0..self.coin_duel_count {
+            if let Some(d) = self.coin_duels.get(&id) {
+                if d.status == 0
+                    && ((d.coin_a == coin_a && d.coin_b == coin_b)
+                        || (d.coin_a == coin_b && d.coin_b == coin_a))
+                {
+                    panic!("an active duel already exists between these coins");
+                }
+            }
+        }
+        // Opt-in: the creator must hold a curve position in one of
+        // the duelling coins, so a stranger with no stake in either
+        // coin cannot open duels between other people's coins.
+        assert!(
+            self.holder_tokens(&creator, coin_a) > 0
+                || self.holder_tokens(&creator, coin_b) > 0,
+            "duel creator must hold one of the duelling coins"
+        );
         let now = env::block_timestamp();
         let id = self.coin_duel_count;
         self.coin_duel_count += 1;
@@ -2620,7 +2922,11 @@ impl Contract {
         );
         let vol_a = self.coin_volume_yocto(duel.coin_a) - duel.vol_a_start;
         let vol_b = self.coin_volume_yocto(duel.coin_b) - duel.vol_b_start;
-        let winner = if vol_a > vol_b {
+        // A duel only pays out on a meaningful volume gain: a
+        // tiny-volume win must not move treasury NEAR.
+        let winner = if vol_a.max(vol_b) < COIN_DUEL_MIN_VOLUME_YOCTO {
+            None
+        } else if vol_a > vol_b {
             Some(duel.coin_a)
         } else if vol_b > vol_a {
             Some(duel.coin_b)
@@ -2634,7 +2940,14 @@ impl Contract {
             let loser = if w == duel.coin_a { duel.coin_b } else { duel.coin_a };
             let mut loser_coin = self.coins.get(&loser).expect("coin not found").clone();
             let mut winner_coin = self.coins.get(&w).expect("coin not found").clone();
-            let payment = loser_coin.near_reserve_yocto * COIN_DUEL_TREASURY_BP / 10_000;
+            let payment_raw = loser_coin.near_reserve_yocto * COIN_DUEL_TREASURY_BP / 10_000;
+            // Aggregate cap per coin pair: across every duel between
+            // these two coins, at most COIN_DUEL_PAIR_CAP_YOCTO may
+            // ever move from one treasury to the other.
+            let pair_key = duel_pair_key(duel.coin_a, duel.coin_b);
+            let already = self.duel_transfers.get(&pair_key).copied().unwrap_or(0);
+            let payment = payment_raw.min(COIN_DUEL_PAIR_CAP_YOCTO.saturating_sub(already));
+            self.duel_transfers.insert(pair_key, already + payment);
             loser_coin.near_reserve_yocto -= payment;
             winner_coin.near_reserve_yocto += payment;
             self.coins.insert(loser, loser_coin);
@@ -2699,6 +3012,10 @@ impl Contract {
         });
         assert!(!md.resolved, "day already resolved");
         assert!(
+            md.submissions.len() < MAX_MEME_SUBMISSIONS_PER_DAY,
+            "too many submissions this day"
+        );
+        assert!(
             !md.submissions.iter().any(|s| s.submitter == submitter),
             "one submission per holder per day"
         );
@@ -2758,8 +3075,9 @@ impl Contract {
 
     /// Record the NEAR AI judge's score for one meme submission. Only
     /// the arena account itself can call this (the judge is the arena
-    /// account; the judge service signs with the arena key). Each
-    /// dimension is 0-100; `total` is their sum (0-300).
+    /// account; the judge service signs with a function-call key
+    /// limited to this method only). Each dimension is 0-100; `total`
+    /// is their sum (0-300).
     /// `attestation_hash` is the SHA-256 hex digest of the attestation
     /// evidence for the NEAR AI completion that produced the score, so
     /// anyone can check the score came from a real attested run.
@@ -2801,6 +3119,12 @@ impl Contract {
                 attestation_hash: attestation_hash.clone(),
             },
         );
+        // Mark the day judging-complete once every text submission
+        // has a score, so resolve_meme_day can open after the grace
+        // period.
+        if self.meme_judging_complete(coin_id, day) {
+            self.judging_complete.insert(format!("{}:{}", coin_id, day));
+        }
         self.record_event(
             "ai_scored",
             env::current_account_id(),
@@ -2812,6 +3136,24 @@ impl Contract {
                 idx, day, humor, originality, relevance, total
             ),
         );
+    }
+
+    /// True when every submission on a day that has meme text also
+    /// has an AI score. Submissions without text need no score.
+    fn meme_judging_complete(&self, coin_id: u64, day: u64) -> bool {
+        let key = format!("{}:{}", coin_id, day);
+        let Some(md) = self.meme_days.get(&key) else {
+            return false;
+        };
+        for i in 0..md.submissions.len() {
+            let text_key = format!("{}:{}:{}", coin_id, day, i as u64);
+            if self.meme_texts.get(&text_key).is_some()
+                && self.ai_scores.get(&text_key).is_none()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Combined winner score for a meme submission (0-200): the AI total
@@ -2835,11 +3177,22 @@ impl Contract {
     pub fn resolve_meme_day(&mut self, coin_id: u64, day: u64) {
         let mut coin = self.coins.get(&coin_id).expect("coin not found").clone();
         let now = env::block_timestamp();
-        assert!(
-            now >= coin.created_at_ns + (day + 1) * MEME_DAY_NS,
-            "day not over yet"
-        );
+        let day_end = coin.created_at_ns + (day + 1) * MEME_DAY_NS;
+        assert!(now >= day_end, "day not over yet");
         let key = format!("{}:{}", coin_id, day);
+        // A day may resolve only once the AI judging is complete and
+        // the scoring grace period has passed (so a last-minute
+        // submission still gets scored), or once the fallback window
+        // has passed without any scores — otherwise the winner would
+        // be picked on community votes alone while the AI half is
+        // still 0 for every submission.
+        let judged = self.judging_complete.contains(&key)
+            || self.meme_judging_complete(coin_id, day);
+        assert!(
+            (judged && now >= day_end + MEME_JUDGING_GRACE_NS)
+                || now >= day_end + MEME_JUDGING_FALLBACK_NS,
+            "AI judging not complete yet; resolve after scores are recorded or the fallback window passes"
+        );
         let mut md = self.meme_days.get(&key).expect("no submissions that day").clone();
         assert!(!md.resolved, "day already resolved");
         assert!(!md.submissions.is_empty(), "no submissions to resolve");
@@ -2920,6 +3273,19 @@ impl Contract {
         );
         let key = Self::follow_key(&copier, &leader);
         assert!(self.follows.get(&key).is_none(), "already following this leader; unfollow first");
+        // Storage limits: the copy public key is informational text
+        // stored at the arena's expense, and the followers list is
+        // unbounded without a cap.
+        let key_text = copy_public_key.unwrap_or_default();
+        assert!(
+            key_text.len() <= MAX_COPY_PUBLIC_KEY_LEN,
+            "copy public key too long"
+        );
+        let mut list = self.followers.get(&leader).cloned().unwrap_or_default();
+        assert!(
+            list.len() < MAX_FOLLOWERS_PER_LEADER,
+            "leader already has the maximum number of followers"
+        );
         self.follows.insert(
             key,
             Follow {
@@ -2930,10 +3296,9 @@ impl Contract {
                 total_copied_yocto: 0,
                 total_sell_volume_yocto: 0,
                 fees_earned_yocto: 0,
-                copy_public_key: copy_public_key.unwrap_or_default(),
+                copy_public_key: key_text,
             },
         );
-        let mut list = self.followers.get(&leader).cloned().unwrap_or_default();
         if !list.contains(&copier) {
             list.push(copier.clone());
             self.followers.insert(leader.clone(), list);
@@ -2990,13 +3355,15 @@ impl Contract {
         assert!(coin.sold_tokens < coin.curve_cap_tokens, "curve sold out");
         let max_tokens = coin.curve_cap_tokens - coin.sold_tokens;
         let leader_fee = fee_yocto(amount, COPY_FEE_BP);
+        // The amount after the leader fee is the total spend for the
+        // copy buy, including the 1% trading fee; the full curve cost
+        // enters the reserve.
         let net = amount - leader_fee;
-        let (tokens, cost) = buy_tokens_for_near(coin.sold_tokens, net, max_tokens);
+        let (tokens, cost, trade_fee) = buy_with_fee(coin.sold_tokens, net, max_tokens);
         assert!(tokens > 0, "amount buys zero tokens");
-        let trade_fee = fee_yocto(cost, TRADING_FEE_BP);
         self.record_trading_fee(trade_fee);
         coin.sold_tokens += tokens;
-        coin.near_reserve_yocto += cost - trade_fee;
+        coin.near_reserve_yocto += cost;
         coin.total_spent_yocto += cost;
         if !coin.holders.contains(&copier) {
             coin.holders.push(copier.clone());
@@ -3032,7 +3399,7 @@ impl Contract {
         if leader_fee > 0 {
             Promise::new(leader).transfer(NearToken::from_yoctonear(leader_fee));
         }
-        let refund = attached - leader_fee - cost;
+        let refund = attached.saturating_sub(leader_fee + cost + trade_fee);
         if refund > 0 {
             Promise::new(copier).transfer(NearToken::from_yoctonear(refund));
         }
@@ -3238,16 +3605,30 @@ impl Contract {
             })
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
-        let (payouts, _rollover) = distribute_pool(season.pool_yocto, &ranked);
-        let total_paid: u128 = payouts.iter().map(|(_, p)| *p).sum();
+        let (mut payouts, rollover) = distribute_pool(season.pool_yocto, &ranked);
+        let mut total_paid: u128 = payouts.iter().map(|(_, p)| *p).sum();
+        // Never pay more than the live prize pool actually holds: a
+        // pre-v8 season record may hold a pool larger than the live
+        // pool (the old wholesale snapshot). Scale payouts down
+        // proportionally in that case, so the contract can never
+        // overpay even across overlapping resolutions.
+        if total_paid > self.prize_pool_yocto {
+            let live = self.prize_pool_yocto;
+            for (_, p) in payouts.iter_mut() {
+                *p = *p * live / total_paid;
+            }
+            total_paid = payouts.iter().map(|(_, p)| *p).sum();
+        }
         season.status = 1;
         season.winners = payouts.iter().map(|(a, _)| a.clone()).collect();
         season.payouts_yocto = payouts.iter().map(|(_, p)| *p).collect();
         self.seasons.insert(season_id, season.clone());
-        // The live pool holds this season's pool plus any fees accrued
-        // since it ended; paying out of it leaves the rollover plus
-        // those newer fees in place for the next season.
+        // Rollover is the actual undistributed amount: this season's
+        // undistributed share, capped at what the live pool still
+        // holds after this payout, so fees that belong to later
+        // seasons are never counted as this season's rollover.
         self.prize_pool_yocto = self.prize_pool_yocto.saturating_sub(total_paid);
+        self.rollover_yocto = rollover.min(self.prize_pool_yocto);
         for (winner, amount) in &payouts {
             if *amount > 0 {
                 Promise::new(winner.clone()).transfer(NearToken::from_yoctonear(*amount));
@@ -3306,6 +3687,9 @@ impl Contract {
             vote_max_duration_hours: VOTE_MAX_DURATION_HOURS,
             coin_duel_duration_hours: 24,
             coin_duel_treasury_bp: COIN_DUEL_TREASURY_BP,
+            coin_duel_min_volume_yocto: COIN_DUEL_MIN_VOLUME_YOCTO.to_string(),
+            coin_duel_pair_cap_yocto: COIN_DUEL_PAIR_CAP_YOCTO.to_string(),
+            meme_judging_grace_ns: MEME_JUDGING_GRACE_NS,
             meme_day_hours: 24,
             meme_reward_yocto: MEME_REWARD_YOCTO.to_string(),
             meme_min_reserve_yocto: MEME_MIN_RESERVE_YOCTO.to_string(),
@@ -3493,6 +3877,7 @@ impl Contract {
             resolved: md.resolved,
             winner_hash: md.winner_hash.clone(),
             winner: md.winner.clone(),
+            judging_complete: self.meme_judging_complete(coin_id, day),
         })
     }
 
@@ -3518,12 +3903,29 @@ impl Contract {
 
     /// Newest first.
     pub fn get_activity(&self, limit: u64) -> Vec<TradeEvent> {
-        let n = self.activity.len() as usize;
-        let take = (limit as usize).min(n);
-        let mut out = Vec::with_capacity(take);
+        let n = self.activity.len();
+        let take = (limit as u32).min(n);
+        let mut out = Vec::with_capacity(take as usize);
         for i in (n - take..n).rev() {
-            if let Some(e) = self.activity.get(i as u32) {
-                out.push(e.clone());
+            if let Some(e) = self.activity_at(i) {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// Activity page: newest first, starting `offset` events from
+    /// the newest. Pagination for the feed, so a client never has to
+    /// pull the whole 500-event ring to reach older events.
+    pub fn get_activity_page(&self, offset: u64, limit: u64) -> Vec<TradeEvent> {
+        let n = self.activity.len();
+        let start = (offset as u32).min(n);
+        let end = n.saturating_sub(start);
+        let take = (limit as u32).min(end);
+        let mut out = Vec::with_capacity(take as usize);
+        for i in (end - take..end).rev() {
+            if let Some(e) = self.activity_at(i) {
+                out.push(e);
             }
         }
         out
@@ -3532,24 +3934,27 @@ impl Contract {
     /// One agent's trades, newest first.
     pub fn get_agent_trades(&self, account: AccountId, limit: u64) -> Vec<TradeEvent> {
         let mut out = Vec::new();
-        let n = self.activity.len() as usize;
+        let n = self.activity.len();
         let mut i = n;
         while i > 0 && out.len() < limit as usize {
             i -= 1;
-            if let Some(e) = self.activity.get(i as u32) {
+            if let Some(e) = self.activity_at(i) {
                 if e.agent == account {
-                    out.push(e.clone());
+                    out.push(e);
                 }
             }
         }
         out
     }
 
+    /// Quote a buy: (tokens received, total NEAR to attach). The
+    /// total includes the 1% trading fee, which comes out of the
+    /// attached amount; the curve cost is the total minus the fee.
     pub fn quote_buy(&self, coin_id: u64, near_yocto: U128) -> (U128, U128) {
         let coin = self.coins.get(&coin_id).expect("coin not found");
         let max_tokens = coin.curve_cap_tokens.saturating_sub(coin.sold_tokens);
-        let (tokens, cost) = buy_tokens_for_near(coin.sold_tokens, near_yocto.0, max_tokens);
-        (U128(tokens), U128(cost))
+        let (tokens, cost, fee) = buy_with_fee(coin.sold_tokens, near_yocto.0, max_tokens);
+        (U128(tokens), U128(cost + fee))
     }
 
     pub fn quote_sell(&self, coin_id: u64, tokens: U128) -> U128 {
@@ -3650,7 +4055,7 @@ impl Contract {
                 id,
                 start_ns: season_start_ns(id),
                 end_ns: season_end_ns(id),
-                pool_yocto: self.prize_pool_yocto,
+                pool_yocto: self.rollover_yocto,
                 status: 0,
                 winners: vec![],
                 payouts_yocto: vec![],
@@ -3802,22 +4207,57 @@ impl FungibleTokenReceiver for Contract {
         let mut dropped_below = false;
         let mut stats = self.get_agent_stats(&sender_id);
         if pos.bought_tokens > 0 {
-            stats.total_received_yocto += net_proceeds;
-            let avg_cost = pos.spent_yocto / pos.bought_tokens;
-            let cost_of_sold = whole_tokens * avg_cost;
+            // H-04: only the part of the sale covered by the recorded
+            // position has a cost basis, and the proceeds credited to
+            // stats are pro-rated to that part. Selling more tokens
+            // than the position holds (a small position plus a large
+            // transfer in) must not multiply the average cost by the
+            // whole sale: that inflated the cost and understated the
+            // realised PnL.
+            let sold_for_stats = whole_tokens.min(pos.bought_tokens);
+            let net_for_stats = net_proceeds * sold_for_stats / whole_tokens;
+            // Cost basis from purchase lots (most recent first, like
+            // the curve), falling back to average cost for any part
+            // with no recorded lots (a pre-v8 position). The cost is
+            // capped at the position's recorded spent amount.
+            let (mut cost_of_sold, hold_ns) =
+                match self.consume_lots(&sender_id, coin_id, sold_for_stats, now) {
+                    Some((spent, hold, consumed)) => {
+                        let mut cost = spent;
+                        let mut hold = hold;
+                        if consumed < sold_for_stats {
+                            let rest = sold_for_stats - consumed;
+                            let avg_cost = pos.spent_yocto / pos.bought_tokens;
+                            cost += rest * avg_cost;
+                            let rest_hold = now.saturating_sub(pos.first_buy_ns) as u128;
+                            hold = (hold * consumed + rest_hold * rest) / sold_for_stats;
+                        }
+                        (cost, hold)
+                    }
+                    None => {
+                        let avg_cost = pos.spent_yocto / pos.bought_tokens;
+                        (
+                            sold_for_stats * avg_cost,
+                            now.saturating_sub(pos.first_buy_ns) as u128,
+                        )
+                    }
+                };
+            cost_of_sold = cost_of_sold.min(pos.spent_yocto);
+            stats.total_received_yocto += net_for_stats;
             stats.sells += 1;
-            if net_proceeds > cost_of_sold {
+            if net_for_stats > cost_of_sold {
                 stats.winning_sells += 1;
             }
-            let hold_ns = now.saturating_sub(pos.first_buy_ns);
-            stats.hold_time_total_ns += hold_ns as u128;
+            // H-07e: hold time is the token-weighted average age of
+            // the lots actually sold, not the age of the first buy.
+            stats.hold_time_total_ns += hold_ns;
             stats.hold_count += 1;
-            let realised_delta = net_proceeds as i128 - cost_of_sold as i128;
+            let realised_delta = net_for_stats as i128 - cost_of_sold as i128;
             pos.realised_yocto += realised_delta;
             self.add_season_pnl(&sender_id, realised_delta);
             self.record_realised(&sender_id, realised_delta);
             pos.spent_yocto = pos.spent_yocto.saturating_sub(cost_of_sold);
-            pos.bought_tokens = pos.bought_tokens.saturating_sub(whole_tokens);
+            pos.bought_tokens = pos.bought_tokens.saturating_sub(sold_for_stats);
             if pos.bought_tokens == 0 {
                 pos.first_buy_ns = 0;
             }
@@ -4415,6 +4855,15 @@ mod tests {
         }
     }
 
+    /// Register accounts as agents in a test (register_agent records
+    /// the predecessor, so the env must be set per account).
+    fn register_agents(c: &mut Contract, accounts: &[&str]) {
+        for a in accounts {
+            testing_env!(audit_ctx(a, 0).build());
+            c.register_agent();
+        }
+    }
+
     #[test]
     fn audit_no_position_sell_credits_no_stats() {
         // HIGH: a seller with no curve position (tokens received by
@@ -4685,6 +5134,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx("alice.testnet", 2_000_000_000_000_000_000_000_000u128).build());
         let id = c.create_battle(0, opponent);
         assert_eq!(id, 0);
@@ -4703,6 +5153,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx("alice.testnet", 2_000_000_000_000_000_000_000_000u128).build());
         c.create_battle(0, opponent);
         // The challenged opponent (or anyone else) cannot cancel.
@@ -4729,6 +5180,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx(
             "alice.testnet",
             50_000_000_000_000_000_000_000u128, // 0.05 NEAR
@@ -4745,6 +5197,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx(
             "alice.testnet",
             2_000_000_000_000_000_000_000_000u128, // 2 NEAR
@@ -4766,6 +5219,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx(
             "alice.testnet",
             2_000_000_000_000_000_000_000_000u128, // 2 NEAR
@@ -4788,6 +5242,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx(
             "alice.testnet",
             2_000_000_000_000_000_000_000_000u128, // 2 NEAR
@@ -4822,6 +5277,7 @@ mod tests {
         let challenger: AccountId = "alice.testnet".parse().unwrap();
         let opponent: AccountId = "bob.testnet".parse().unwrap();
         c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet", "bob.testnet"]);
         testing_env!(audit_ctx(
             "alice.testnet",
             2_000_000_000_000_000_000_000_000u128, // 2 NEAR
@@ -4860,6 +5316,42 @@ mod tests {
             2_000_000_000_000_000_000_000_000u128
         );
         assert_eq!(c.get_agent_stats(&challenger).battles_won, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "only registered agents create battles")]
+    fn v8_create_battle_rejects_unregistered_challenger() {
+        // Battles are agent-only (v8): an unregistered wallet cannot
+        // create a battle even with a valid stake.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128,
+        )
+        .build());
+        c.create_battle(0, opponent);
+    }
+
+    #[test]
+    #[should_panic(expected = "opponent must be a registered agent")]
+    fn v8_create_battle_rejects_unregistered_opponent() {
+        // A registered challenger cannot battle an unregistered wallet.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let challenger: AccountId = "alice.testnet".parse().unwrap();
+        let opponent: AccountId = "bob.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, challenger.clone()));
+        register_agents(&mut c, &["alice.testnet"]);
+        testing_env!(audit_ctx(
+            "alice.testnet",
+            2_000_000_000_000_000_000_000_000u128,
+        )
+        .build());
+        c.create_battle(0, opponent);
     }
 
     #[test]
@@ -4921,6 +5413,734 @@ mod tests {
         // get_params shows registration is live.
         let c = Contract::new();
         assert!(c.get_params().agent_registration_enabled);
+    }
+
+    // --- v8 regression tests (PAC smart-contract audit fixes) ---
+
+    #[test]
+    fn v8_buy_fee_keeps_reserve_whole() {
+        // H-01: the 1% buy fee comes out of the attached amount, so
+        // the full curve cost enters the reserve and the gross sell
+        // proceeds of a round trip equal the reserve exactly.
+        for attached in [
+            10_000_000_000_000_000_000_000u128, // 0.01 NEAR
+            100_000_000_000_000_000_000_000u128, // 0.1 NEAR
+            1_000_000_000_000_000_000_000_000u128, // 1 NEAR
+        ] {
+            let (tokens, cost, fee) = buy_with_fee(0, attached, MAX_CURVE_TOKENS);
+            assert!(tokens > 0);
+            assert!(cost + fee <= attached, "cost + fee must fit the attached amount");
+            assert_eq!(fee, fee_yocto(cost, TRADING_FEE_BP));
+            // Round trip: sell everything back, gross proceeds == cost.
+            let proceeds = sell_proceeds_yocto(tokens, tokens);
+            assert_eq!(proceeds, cost, "round-trip gross proceeds must equal the reserve");
+            // The seller nets 99% of the gross proceeds.
+            assert_eq!(proceeds - fee_yocto(proceeds, TRADING_FEE_BP), cost - fee);
+        }
+    }
+
+    #[test]
+    fn v8_round_trip_sell_succeeds_with_exact_reserve() {
+        // H-01, contract level: a sole buyer whose position's curve
+        // cost equals the coin reserve can sell the whole position
+        // back. Under the old accounting the reserve was cost minus
+        // the 1% fee, so this sell panicked on "curve reserve
+        // insufficient".
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        let proceeds = sell_proceeds_yocto(coin.sold_tokens, 10_000);
+        coin.near_reserve_yocto = proceeds; // reserve == exact redemption obligation
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let seller: AccountId = "trader.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&seller, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: proceeds,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let _ = c.ft_on_transfer(seller, U128(10_000 * DECIMAL_MULT), "sell".to_string());
+        assert_eq!(c.coins.get(&0).unwrap().near_reserve_yocto, 0);
+    }
+
+    #[test]
+    fn v8_multiple_buyers_round_trip() {
+        // H-01: two buyers can each sell their whole position back
+        // when the reserve holds the sum of their curve costs.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        // Buyer A sells 10,000 tokens from sold 1,000,000; buyer B
+        // sells 5,000 after that. Reserve = both gross proceeds.
+        let proceeds_a = sell_proceeds_yocto(1_000_000, 10_000);
+        let proceeds_b = sell_proceeds_yocto(990_000, 5_000);
+        coin.near_reserve_yocto = proceeds_a + proceeds_b;
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let a: AccountId = "a.testnet".parse().unwrap();
+        let b: AccountId = "b.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&a, 0),
+            Position { bought_tokens: 10_000, spent_yocto: proceeds_a, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        c.positions.insert(
+            Contract::position_key(&b, 0),
+            Position { bought_tokens: 5_000, spent_yocto: proceeds_b, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let _ = c.ft_on_transfer(a, U128(10_000 * DECIMAL_MULT), "sell".to_string());
+        let _ = c.ft_on_transfer(b, U128(5_000 * DECIMAL_MULT), "sell".to_string());
+        assert_eq!(c.coins.get(&0).unwrap().near_reserve_yocto, 0);
+    }
+
+    #[test]
+    fn v8_copy_trade_round_trip() {
+        // H-01: a copy buy followed by a copy sell of the whole
+        // vaulted position succeeds when the reserve holds the curve
+        // cost, with the trade fee and copy fee coming out of the
+        // proceeds.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let coin = audit_coin(token_id.clone(), creator);
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let copier: AccountId = "copier.testnet".parse().unwrap();
+        let leader: AccountId = "leader.testnet".parse().unwrap();
+        c.follows.insert(
+            Contract::follow_key(&copier, &leader),
+            Follow {
+                copier: copier.clone(),
+                leader: leader.clone(),
+                amount_per_trade_yocto: 100_000_000_000_000_000_000_000,
+                max_total_yocto: 1_000_000_000_000_000_000_000_000,
+                total_copied_yocto: 0,
+                total_sell_volume_yocto: 0,
+                fees_earned_yocto: 0,
+                copy_public_key: String::new(),
+            },
+        );
+        // Vaulted position: 10,000 tokens, reserve set to exactly
+        // their gross sell proceeds.
+        let proceeds = sell_proceeds_yocto(1_000_000, 10_000);
+        let mut coin = c.coins.get(&0).unwrap().clone();
+        coin.near_reserve_yocto = proceeds;
+        c.coins.insert(0, coin);
+        c.copy_positions.insert(
+            Contract::copy_position_key(&copier, &leader, 0),
+            CopyPosition {
+                copier: copier.clone(),
+                leader: leader.clone(),
+                coin_id: 0,
+                tokens: 10_000,
+                spent_yocto: proceeds,
+            },
+        );
+        testing_env!(audit_ctx("copier.testnet", 0).build());
+        c.copy_sell(0, leader, U128(10_000));
+        assert_eq!(c.coins.get(&0).unwrap().near_reserve_yocto, 0);
+    }
+
+    #[test]
+    fn v8_duel_second_pair_duel_rejected() {
+        // H-02: only one active duel per coin pair, in either order.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "alice.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, creator.clone()));
+        let token1: AccountId = "c1.pac-arena.testnet".parse().unwrap();
+        c.coins.insert(1, audit_coin(token1, creator.clone()));
+        c.positions.insert(
+            Contract::position_key(&creator, 0),
+            Position { bought_tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.create_coin_duel(0, 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.create_coin_duel(0, 1);
+        }));
+        assert!(r.is_err(), "second duel between the same pair must be rejected");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.create_coin_duel(1, 0);
+        }));
+        assert!(r.is_err(), "reversed pair is the same pair and must be rejected");
+    }
+
+    #[test]
+    #[should_panic(expected = "duel creator must hold one of the duelling coins")]
+    fn v8_duel_rejects_creator_with_no_stake() {
+        // H-02 opt-in: a stranger holding neither coin cannot open a
+        // duel between other people's coins.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "alice.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, creator.clone()));
+        let token1: AccountId = "c1.pac-arena.testnet".parse().unwrap();
+        c.coins.insert(1, audit_coin(token1, creator));
+        testing_env!(audit_ctx("stranger.testnet", 0).build());
+        c.create_coin_duel(0, 1);
+    }
+
+    #[test]
+    fn v8_duel_tiny_volume_pays_nothing() {
+        // H-02: a duel won on a tiny volume gain (below 0.1 NEAR)
+        // moves no treasury NEAR.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "alice.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, creator.clone()));
+        let token1: AccountId = "c1.pac-arena.testnet".parse().unwrap();
+        c.coins.insert(1, audit_coin(token1, creator.clone()));
+        c.positions.insert(
+            Contract::position_key(&creator, 0),
+            Position { bought_tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        let id = c.create_coin_duel(0, 1);
+        // Tiny volume gain on coin 0 only (0.001 NEAR).
+        let mut coin0 = c.coins.get(&0).unwrap().clone();
+        coin0.total_spent_yocto += 1_000_000_000_000_000_000_000;
+        c.coins.insert(0, coin0);
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("alice.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000_000_000 + COIN_DUEL_DURATION_NS + 1);
+        testing_env!(b.build());
+        let before_a = c.coins.get(&0).unwrap().near_reserve_yocto;
+        let before_b = c.coins.get(&1).unwrap().near_reserve_yocto;
+        c.resolve_coin_duel(id);
+        assert_eq!(c.coin_duels.get(&id).unwrap().winner, None);
+        assert_eq!(c.coins.get(&0).unwrap().near_reserve_yocto, before_a);
+        assert_eq!(c.coins.get(&1).unwrap().near_reserve_yocto, before_b);
+    }
+
+    #[test]
+    fn v8_duel_pair_cap_limits_total_payments() {
+        // H-02: aggregate treasury transfers between one coin pair
+        // never exceed 1 NEAR, however many duels resolve.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "alice.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, creator.clone()));
+        let token1: AccountId = "c1.pac-arena.testnet".parse().unwrap();
+        c.coins.insert(1, audit_coin(token1, creator.clone()));
+        c.positions.insert(
+            Contract::position_key(&creator, 0),
+            Position { bought_tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        // Three duels, coin 0 winning each time on 1 NEAR of volume.
+        // Each would pay 5% of the 10 NEAR reserve = 0.5 NEAR; the
+        // third must pay 0 because the 1 NEAR pair cap is reached.
+        for duel_no in 0..3 {
+            testing_env!(audit_ctx("alice.testnet", 0).build());
+            let id = c.create_coin_duel(0, 1);
+            let mut coin0 = c.coins.get(&0).unwrap().clone();
+            coin0.total_spent_yocto += 1_000_000_000_000_000_000_000_000;
+            c.coins.insert(0, coin0);
+            let mut b = VMContextBuilder::new();
+            b.predecessor_account_id("alice.testnet".parse().unwrap())
+                .current_account_id("pac-arena.testnet".parse().unwrap())
+                .attached_deposit(NearToken::from_yoctonear(0))
+                .block_timestamp(
+                    1_000_000_000_000_000_000 + COIN_DUEL_DURATION_NS + 1 + duel_no as u64 * 1_000_000_000,
+                );
+            testing_env!(b.build());
+            c.resolve_coin_duel(id);
+        }
+        let transferred = c
+            .duel_transfers
+            .get(&duel_pair_key(0, 1))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(transferred, COIN_DUEL_PAIR_CAP_YOCTO);
+        // Coin 1 lost exactly the cap, no more.
+        assert_eq!(
+            c.coins.get(&1).unwrap().near_reserve_yocto,
+            10_000_000_000_000_000_000_000_000 - COIN_DUEL_PAIR_CAP_YOCTO
+        );
+    }
+
+    #[test]
+    fn v8_transfer_out_reduces_position_and_qualification() {
+        // H-03: a plain transfer out reduces the recorded position
+        // and drops qualified status; a transfer in creates no
+        // position at all.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        coin.qualified_holders = 1;
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let holder: AccountId = "holder.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&holder, 0),
+            Position {
+                bought_tokens: 20_000,
+                spent_yocto: 20_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let receiver: AccountId = "receiver.testnet".parse().unwrap();
+        c.on_token_transfer(holder.clone(), receiver.clone(), U128(15_000 * DECIMAL_MULT));
+        let pos = c.positions.get(&Contract::position_key(&holder, 0)).unwrap();
+        assert_eq!(pos.bought_tokens, 5_000);
+        assert_eq!(pos.spent_yocto, 5_000_000_000_000_000_000_000);
+        assert_eq!(c.coins.get(&0).unwrap().qualified_holders, 0);
+        assert_eq!(c.holder_tokens(&holder, 0), 5_000);
+        // Transfer in creates no position for the receiver.
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        c.on_token_transfer(receiver.clone(), holder.clone(), U128(15_000 * DECIMAL_MULT));
+        assert!(c.positions.get(&Contract::position_key(&receiver, 0)).is_none());
+        assert_eq!(c.holder_tokens(&receiver, 0), 0);
+    }
+
+    #[test]
+    fn v8_creator_proxy_sale_loses_position() {
+        // H-03: a creator that moves its initial buy to a proxy wallet
+        // loses the recorded position; the proxy gains none, so the
+        // creator cannot keep voting/claiming on tokens it moved away.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator.clone());
+        coin.qualified_holders = 1;
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        c.positions.insert(
+            Contract::position_key(&creator, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let proxy: AccountId = "proxy.testnet".parse().unwrap();
+        c.on_token_transfer(creator.clone(), proxy.clone(), U128(10_000 * DECIMAL_MULT));
+        assert_eq!(c.holder_tokens(&creator, 0), 0);
+        assert_eq!(c.holder_tokens(&proxy, 0), 0);
+        assert_eq!(c.coins.get(&0).unwrap().qualified_holders, 0);
+    }
+
+    #[test]
+    fn v8_small_position_large_transfer_sale() {
+        // H-04: a small curve position (10,000 tokens, 0.01 NEAR
+        // cost) plus a large transfer in, sold together (100,000
+        // tokens). Only the position's share of the proceeds counts
+        // as realised PnL, and the cost basis is capped at the
+        // recorded position. The old code multiplied the average cost
+        // by the whole sale (cost 0.1 NEAR) and understated the
+        // realised PnL.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id.clone(), creator));
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let seller: AccountId = "trader.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&seller, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000, // 0.01 NEAR
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        testing_env!(audit_ctx("c0.pac-arena.testnet", 0).build());
+        let _ = c.ft_on_transfer(seller.clone(), U128(100_000 * DECIMAL_MULT), "sell".to_string());
+        // Gross proceeds for 100,000 tokens sold from 1,000,000
+        // sold is 100,000 * 1e18 = 0.1 NEAR (chunk 0 price); net
+        // after the 1% fee is 0.099 NEAR; the position's tenth share
+        // is 0.0099 NEAR received against 0.01 NEAR cost, so the
+        // realised PnL is -0.0001 NEAR. The old code multiplied the
+        // average cost by the whole 100,000-token sale (cost 0.1
+        // NEAR) and reported -0.001 NEAR instead.
+        let stats = c.get_agent_stats(&seller);
+        assert_eq!(stats.total_received_yocto, 9_900_000_000_000_000_000_000);
+        assert_eq!(stats.sells, 1);
+        let pos = c.positions.get(&Contract::position_key(&seller, 0)).unwrap();
+        assert_eq!(pos.bought_tokens, 0);
+        assert_eq!(pos.spent_yocto, 0);
+        assert_eq!(pos.realised_yocto, -100_000_000_000_000_000_000);
+        let season_id = c.current_season_id();
+        assert_eq!(
+            c.season_pnl.get(&Contract::season_pnl_key(season_id, &seller)).copied().unwrap_or(0),
+            -100_000_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn v8_hold_time_uses_lots_not_first_buy() {
+        // H-07e: a tiny old lot plus a big recent lot, selling the
+        // recent lot, scores about 1 hour held, not 24 hours.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id.clone(), creator));
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let trader: AccountId = "trader.testnet".parse().unwrap();
+        let t0 = 1_000_000_000_000_000_000u64;
+        c.positions.insert(
+            Contract::position_key(&trader, 0),
+            Position {
+                bought_tokens: 20_000,
+                spent_yocto: 20_000_000_000_000_000_000_000,
+                first_buy_ns: t0,
+                realised_yocto: 0,
+            },
+        );
+        c.position_lots.insert(
+            Contract::position_key(&trader, 0),
+            vec![
+                Lot { tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, bought_ns: t0 },
+                Lot {
+                    tokens: 10_000,
+                    spent_yocto: 10_000_000_000_000_000_000_000,
+                    bought_ns: t0 + 23 * 3_600_000_000_000,
+                },
+            ],
+        );
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("c0.pac-arena.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(t0 + 24 * 3_600_000_000_000);
+        testing_env!(b.build());
+        let _ = c.ft_on_transfer(trader.clone(), U128(10_000 * DECIMAL_MULT), "sell".to_string());
+        let stats = c.get_agent_stats(&trader);
+        assert_eq!(stats.hold_count, 1);
+        // The recent lot was bought 23h into the 24h window, so the
+        // tokens sold were held 1 hour.
+        assert_eq!(stats.hold_time_total_ns, 3_600_000_000_000);
+    }
+
+    // H-05 helper: two overlapping seasons never pay the same NEAR
+    // twice, in either resolution order. Each season's pool is its
+    // own fees plus rollover; the live pool is only a cap. This is a
+    // helper, not a test, because a second Contract::new() in the
+    // same test would read back the first one's storage (the unit
+    // test mock keys storage by prefix), so each order runs in its
+    // own test function.
+    fn season_no_double_count(resolve_first: u64) {
+        {
+            let mut c = Contract::new();
+            let alice: AccountId = "alice.testnet".parse().unwrap();
+            let s0 = 10u64;
+            let s1 = 11u64;
+            // Season 10: 1 NEAR of fees, alice +1 NEAR PnL.
+            let mut b = VMContextBuilder::new();
+            b.predecessor_account_id("alice.testnet".parse().unwrap())
+                .current_account_id("pac-arena.testnet".parse().unwrap())
+                .attached_deposit(NearToken::from_yoctonear(0))
+                .block_timestamp(season_start_ns(s0) + 86_400_000_000_000);
+            testing_env!(b.build());
+            c.record_trading_fee(1_000_000_000_000_000_000_000_000);
+            c.add_season_pnl(&alice, 1_000_000_000_000_000_000_000_000);
+            // Season 11: 1 NEAR of fees, alice +1 NEAR PnL.
+            let mut b = VMContextBuilder::new();
+            b.predecessor_account_id("alice.testnet".parse().unwrap())
+                .current_account_id("pac-arena.testnet".parse().unwrap())
+                .attached_deposit(NearToken::from_yoctonear(0))
+                .block_timestamp(season_start_ns(s1) + 86_400_000_000_000);
+            testing_env!(b.build());
+            c.record_trading_fee(1_000_000_000_000_000_000_000_000);
+            c.add_season_pnl(&alice, 1_000_000_000_000_000_000_000_000);
+            assert_eq!(c.prize_pool_yocto, 2_000_000_000_000_000_000_000_000);
+            // Resolve in the chosen order, each after its season ends.
+            let order = if resolve_first == 0 { [s0, s1] } else { [s1, s0] };
+            for sid in order {
+                let mut b = VMContextBuilder::new();
+                b.predecessor_account_id("alice.testnet".parse().unwrap())
+                    .current_account_id("pac-arena.testnet".parse().unwrap())
+                    .attached_deposit(NearToken::from_yoctonear(0))
+                    .block_timestamp(season_end_ns(sid) + 1);
+                testing_env!(b.build());
+                c.resolve_season(sid);
+            }
+            // Each season paid its top agent 50% of its own 1 NEAR
+            // pool: 1 NEAR total paid, 1 NEAR left live, 0.5 NEAR
+            // rollover from the last resolved season.
+            assert_eq!(c.prize_pool_yocto, 1_000_000_000_000_000_000_000_000);
+            assert_eq!(c.rollover_yocto, 500_000_000_000_000_000_000_000);
+            assert_eq!(c.seasons.get(&s0).unwrap().payouts_yocto, vec![500_000_000_000_000_000_000_000]);
+            assert_eq!(c.seasons.get(&s1).unwrap().payouts_yocto, vec![500_000_000_000_000_000_000_000]);
+        }
+    }
+
+    #[test]
+    fn v8_season_pools_do_not_double_count_forward() {
+        season_no_double_count(0);
+    }
+
+    #[test]
+    fn v8_season_pools_do_not_double_count_reverse() {
+        season_no_double_count(1);
+    }
+
+    #[test]
+    fn v8_meme_day_cannot_resolve_before_judging() {
+        // H-07a: a meme day with an unscored text submission cannot
+        // resolve at day end; once the AI scores it and the grace
+        // period passes, it resolves.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        // Day 0 runs from the audit_ctx timestamp (1e18 ns).
+        coin.created_at_ns = 1_000_000_000_000_000_000;
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let submitter: AccountId = "alice.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&submitter, 0),
+            Position { bought_tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.submit_meme(0, "QmHash".to_string(), Some("a funny meme".to_string()));
+        // Day end + 30 minutes: judging not done, grace not passed.
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("alice.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000_000_000 + MEME_DAY_NS + 1_800_000_000_000);
+        testing_env!(b.build());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.resolve_meme_day(0, 0);
+        }));
+        assert!(r.is_err(), "unscored meme day must not resolve early");
+        // The arena (judge) scores the submission.
+        testing_env!(audit_ctx("pac-arena.testnet", 0).build());
+        c.record_ai_score(0, 0, 0, 80, 70, 90, "abc".to_string());
+        assert!(c.judging_complete.contains(&"0:0".to_string()));
+        // After the 1h grace period, it resolves.
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("alice.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000_000_000 + MEME_DAY_NS + MEME_JUDGING_GRACE_NS + 1);
+        testing_env!(b.build());
+        c.resolve_meme_day(0, 0);
+        assert!(c.meme_days.get(&"0:0".to_string()).unwrap().resolved);
+    }
+
+    #[test]
+    fn v8_meme_day_resolves_after_fallback_without_scores() {
+        // H-07a: a day the judge never scores is not stuck forever;
+        // it resolves after the 24h fallback window.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut coin = audit_coin(token_id.clone(), creator);
+        coin.created_at_ns = 1_000_000_000_000_000_000;
+        c.coins.insert(0, coin);
+        c.token_to_coin.insert(token_id.clone(), 0);
+        let submitter: AccountId = "alice.testnet".parse().unwrap();
+        c.positions.insert(
+            Contract::position_key(&submitter, 0),
+            Position { bought_tokens: 10_000, spent_yocto: 10_000_000_000_000_000_000_000, first_buy_ns: 0, realised_yocto: 0 },
+        );
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        c.submit_meme(0, "QmHash".to_string(), Some("a funny meme".to_string()));
+        let mut b = VMContextBuilder::new();
+        b.predecessor_account_id("alice.testnet".parse().unwrap())
+            .current_account_id("pac-arena.testnet".parse().unwrap())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .block_timestamp(1_000_000_000_000_000_000 + MEME_DAY_NS + MEME_JUDGING_FALLBACK_NS + 1);
+        testing_env!(b.build());
+        c.resolve_meme_day(0, 0);
+        assert!(c.meme_days.get(&"0:0".to_string()).unwrap().resolved);
+    }
+
+    #[test]
+    fn v8_activity_ring_keeps_newest() {
+        // H-08 (activity feed): after 501 events the feed still
+        // holds 500, drops the oldest, and keeps the newest first.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("alice.testnet", 0).build());
+        for i in 0..501 {
+            c.record_event(
+                "buy",
+                "alice.testnet".parse().unwrap(),
+                0,
+                0,
+                0,
+                format!("event {}", i),
+            );
+        }
+        assert_eq!(c.activity.len(), 500);
+        let newest = c.get_activity(1);
+        assert_eq!(newest[0].note, "event 500");
+        let all = c.get_activity(500);
+        assert_eq!(all.len(), 500);
+        assert_eq!(all[499].note, "event 1", "oldest retained event is event 1");
+        // Pagination: page 1 starts at the 11th newest event.
+        let page = c.get_activity_page(10, 5);
+        assert_eq!(page.len(), 5);
+        assert_eq!(page[0].note, "event 490");
+        assert_eq!(page[4].note, "event 486");
+    }
+
+    #[test]
+    #[should_panic(expected = "copy public key too long")]
+    fn v8_follow_rejects_long_copy_key() {
+        // H-07c: the copy public key is informational text stored at
+        // the arena's expense, so it is capped.
+        let mut c = Contract::new();
+        testing_env!(audit_ctx("copier.testnet", 0).build());
+        c.follow(
+            "leader.testnet".parse().unwrap(),
+            U128(100_000_000_000_000_000_000_000),
+            U128(1_000_000_000_000_000_000_000_000),
+            Some("k".repeat(129)),
+        );
+    }
+
+    #[test]
+    fn v8_quote_buy_includes_fee() {
+        // H-01: quote_buy returns (tokens, total NEAR to attach),
+        // including the 1% fee.
+        let mut c = Contract::new();
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        c.coins.insert(0, audit_coin(token_id, creator));
+        let (tokens, total) = c.quote_buy(0, U128(100_000_000_000_000_000_000_000));
+        let (t2, cost, fee) = buy_with_fee(1_000_000, 100_000_000_000_000_000_000_000, MAX_CURVE_TOKENS);
+        assert_eq!(tokens.0, t2);
+        assert_eq!(total.0, cost + fee);
+        assert!(total.0 <= 100_000_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn v8_launch_fee_math_refunds_excess() {
+        // H-07d: launching with initial buy + 2 NEAR leaves only
+        // dust excess (cost + fee <= initial buy), never a shortfall.
+        for initial in [
+            10_000_000_000_000_000_000_000u128, // 0.01 NEAR minimum
+            500_000_000_000_000_000_000_000u128, // 0.5 NEAR default
+            1_000_000_000_000_000_000_000_000u128, // 1 NEAR
+        ] {
+            let (tokens, cost, fee) = buy_with_fee(0, initial, MAX_CURVE_TOKENS);
+            assert!(tokens > 0);
+            assert!(cost + fee <= initial);
+            let excess = initial - (cost + fee);
+            assert!(excess < 1_000_000_000_000_000_000_000, "excess must be dust, not a real amount");
+        }
+    }
+
+
+    #[test]
+    fn v8_migrate_v7_to_v8_preserves_state() {
+        // The v7 -> v8 migration must copy every v7 field and
+        // collection verbatim and start the four v8 fields fresh
+        // (rollover 0, empty duel-transfer caps, purchase lots and
+        // judging-complete set, activity head 0). Seed a v7 state with
+        // non-default values, then migrate.
+        testing_env!(audit_ctx("pac-arena.testnet", 0).build());
+        let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
+        let creator: AccountId = "creator.testnet".parse().unwrap();
+        let mut old = OldContract {
+            coin_count: 1,
+            battle_count: 0,
+            agent_count: 1,
+            vote_round_count: 0,
+            coin_duel_count: 0,
+            coins: LookupMap::new(b"c"),
+            token_to_coin: LookupMap::new(b"t"),
+            agents: LookupMap::new(b"a"),
+            positions: LookupMap::new(b"p"),
+            battles: LookupMap::new(b"b"),
+            activity: Vector::new(b"e"),
+            vote_rounds: LookupMap::new(b"v"),
+            coin_duels: LookupMap::new(b"d"),
+            meme_days: LookupMap::new(b"m"),
+            prize_pool_yocto: 1_000_000_000_000_000_000_000_000,
+            follows: LookupMap::new(b"f"),
+            followers: LookupMap::new(b"w"),
+            copy_positions: LookupMap::new(b"k"),
+            seasons: LookupMap::new(b"s"),
+            season_pnl: LookupMap::new(b"n"),
+            meme_texts: LookupMap::new(b"x"),
+            ai_scores: LookupMap::new(b"j"),
+            agent_rep: LookupMap::new(b"r"),
+            schema_version: 7,
+            registered_agents: LookupSet::new(b"g"),
+        };
+        let mut coin = audit_coin(token_id.clone(), creator.clone());
+        coin.qualified_holders = 3;
+        let old_coin = OldCoin {
+            id: coin.id,
+            token_id: coin.token_id.clone(),
+            name: coin.name.clone(),
+            symbol: coin.symbol.clone(),
+            description: coin.description.clone(),
+            creator: coin.creator.clone(),
+            created_at_ns: coin.created_at_ns,
+            sold_tokens: coin.sold_tokens,
+            locked_tokens: coin.locked_tokens,
+            initial_buy_tokens: coin.initial_buy_tokens,
+            unlock_at_ns: coin.unlock_at_ns,
+            creator_sold_after_unlock: coin.creator_sold_after_unlock,
+            near_reserve_yocto: coin.near_reserve_yocto,
+            total_spent_yocto: coin.total_spent_yocto,
+            total_received_yocto: coin.total_received_yocto,
+            total_supply_tokens: coin.total_supply_tokens,
+            curve_cap_tokens: coin.curve_cap_tokens,
+            burned_tokens: coin.burned_tokens,
+            milestones_fired: coin.milestones_fired.clone(),
+            airdrop_per_holder: coin.airdrop_per_holder,
+            airdrop_claimed: coin.airdrop_claimed.clone(),
+            holders: coin.holders.clone(),
+            qualified_holders: coin.qualified_holders,
+            image_url: coin.image_url.clone(),
+        };
+        old.coins.insert(0, old_coin);
+        old.token_to_coin.insert(token_id.clone(), 0);
+        old.positions.insert(
+            Contract::position_key(&creator, 0),
+            Position {
+                bought_tokens: 10_000,
+                spent_yocto: 10_000_000_000_000_000_000_000,
+                first_buy_ns: 0,
+                realised_yocto: 0,
+            },
+        );
+        old.registered_agents.insert(creator.clone());
+        env::state_write(&old);
+        // Dropping flushes the old collections to the mock storage,
+        // the way the live chain already holds them.
+        drop(old);
+        let migrated = Contract::migrate();
+        assert_eq!(migrated.schema_version, 8);
+        assert_eq!(migrated.coin_count, 1);
+        assert_eq!(migrated.prize_pool_yocto, 1_000_000_000_000_000_000_000_000);
+        assert_eq!(migrated.coins.get(&0).unwrap().qualified_holders, 3);
+        assert_eq!(migrated.coins.get(&0).unwrap().near_reserve_yocto, coin.near_reserve_yocto);
+        assert_eq!(migrated.holder_tokens(&creator, 0), 10_000);
+        assert!(migrated.registered_agents.contains(&creator));
+        assert_eq!(migrated.rollover_yocto, 0);
+        assert!(migrated.duel_transfers.get(&duel_pair_key(0, 1)).is_none());
+        assert!(migrated.position_lots.get(&Contract::position_key(&creator, 0)).is_none());
+        assert!(!migrated.judging_complete.contains(&"0:0".to_string()));
+        assert_eq!(migrated.activity_head, 0);
+        assert_eq!(migrated.get_params().schema_version, 8);
+        // A second migrate() on the migrated state must fail.
+        env::state_write(&migrated);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Contract::migrate();
+        }));
+        assert!(r.is_err(), "second migrate() must be rejected");
     }
 
 }
