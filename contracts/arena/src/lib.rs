@@ -109,8 +109,11 @@ pub const BATTLE_MIN_STAKE_YOCTO: u128 = 100_000_000_000_000_000_000_000;
 /// NEAR attached to a launch to fund the new coin sub-account and its
 /// token contract storage (2 NEAR).
 pub const LAUNCH_COST_YOCTO: u128 = 2_000_000_000_000_000_000_000_000;
-/// Minimum initial buy at launch, yoctoNEAR (0.01 NEAR).
-pub const MIN_INITIAL_BUY_YOCTO: u128 = 10_000_000_000_000_000_000_000;
+/// Minimum initial buy at launch, yoctoNEAR (0.1 NEAR).
+pub const MIN_INITIAL_BUY_YOCTO: u128 = 100_000_000_000_000_000_000_000;
+/// Maximum initial buy at launch, yoctoNEAR (10 NEAR). Caps how much
+/// of the curve a creator can take at launch.
+pub const MAX_INITIAL_BUY_YOCTO: u128 = 10_000_000_000_000_000_000_000_000;
 /// Max lengths for coin name / symbol / description at launch (chars).
 /// The arena pays storage for the coin record out of its own balance,
 /// so unbounded strings would let a launcher bloat arena storage for
@@ -578,6 +581,7 @@ pub struct ParamsView {
     pub battle_min_stake_yocto: String,
     pub launch_cost_yocto: String,
     pub min_initial_buy_yocto: String,
+    pub max_initial_buy_yocto: String,
     pub rep_weight_pnl: u64,
     pub rep_weight_win_rate: u64,
     pub rep_weight_hold_time: u64,
@@ -629,7 +633,7 @@ pub struct ParamsView {
     pub season_duration_ns: u64,
     pub season_duration_days: u64,
     pub season_top_shares_bp: Vec<u128>,
-    /// Contract schema version (v8). Lets anyone confirm which
+    /// Contract schema version (v9). Lets anyone confirm which
     /// contract code is live without reading the WASM.
     pub schema_version: u32,
     /// Meme judging grace period, nanoseconds (v8).
@@ -1272,9 +1276,9 @@ pub struct Contract {
     /// AgentStats map deserialises unchanged. Starts empty at v5.
     agent_rep: LookupMap<AccountId, AgentRep>,
     // --- v6 field (appended after the v5 fields) ---
-    /// Contract schema version. Set to 8 by new() and by migrate().
-    /// migrate() requires the old state's schema_version to be 7,
-    /// so a second migrate() on v8 state (schema_version 8) panics
+    /// Contract schema version. Set to 9 by new() and by migrate().
+    /// migrate() requires the old state's schema_version to be 8,
+    /// so a second migrate() on v9 state (schema_version 9) panics
     /// instead of silently re-copying the state.
     schema_version: u32,
     // --- v7 field (appended after schema_version) ---
@@ -1391,6 +1395,45 @@ pub struct OldContract {
     registered_agents: LookupSet<AccountId>,
 }
 
+/// The v8 contract state, kept verbatim so migrate() can deserialise
+/// the live v8 bytes and rebuild the v9 state from them. Field order
+/// and types must match the v8 Contract exactly; do not edit. The v9
+/// Contract is identical to the v8 Contract (the v9 changes are
+/// constants, not state), so migrate() moves every field verbatim.
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct OldContractV8 {
+    coin_count: u64,
+    battle_count: u64,
+    agent_count: u64,
+    vote_round_count: u64,
+    coin_duel_count: u64,
+    coins: LookupMap<u64, Coin>,
+    token_to_coin: LookupMap<AccountId, u64>,
+    agents: LookupMap<AccountId, AgentStats>,
+    positions: LookupMap<String, Position>,
+    battles: LookupMap<u64, Battle>,
+    activity: Vector<TradeEvent>,
+    vote_rounds: LookupMap<u64, VoteRound>,
+    coin_duels: LookupMap<u64, CoinDuel>,
+    meme_days: LookupMap<String, MemeDay>,
+    prize_pool_yocto: u128,
+    follows: LookupMap<String, Follow>,
+    followers: LookupMap<AccountId, Vec<AccountId>>,
+    copy_positions: LookupMap<String, CopyPosition>,
+    seasons: LookupMap<u64, Season>,
+    season_pnl: LookupMap<String, i128>,
+    meme_texts: LookupMap<String, String>,
+    ai_scores: LookupMap<String, AiScore>,
+    agent_rep: LookupMap<AccountId, AgentRep>,
+    schema_version: u32,
+    registered_agents: LookupSet<AccountId>,
+    rollover_yocto: u128,
+    duel_transfers: LookupMap<String, u128>,
+    position_lots: LookupMap<String, Vec<Lot>>,
+    judging_complete: LookupSet<String>,
+    activity_head: u32,
+}
+
 #[near]
 impl Contract {
     #[init]
@@ -1419,7 +1462,7 @@ impl Contract {
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
-            schema_version: 8,
+            schema_version: 9,
             registered_agents: LookupSet::new(b"g"),
             rollover_yocto: 0,
             duel_transfers: LookupMap::new(b"u"),
@@ -1429,69 +1472,35 @@ impl Contract {
         }
     }
 
-    /// Migrate the live v7 state to v8 without wiping it. Deploy the
-    /// v8 WASM over the v7 contract, then call this once. It reads the
-    /// old state as OldContract and copies every v7 field and
+    /// Migrate the live v8 state to v9 without wiping it. Deploy the
+    /// v9 WASM over the v8 contract, then call this once. It reads the
+    /// old state as OldContractV8 and copies every v8 field and
     /// collection verbatim (coins, agents, positions, battles, vote
     /// rounds, coin duels, meme days, meme texts, AI scores, activity,
     /// prize pool, follows, copy positions, seasons, agent_rep,
-    /// registered agents). The v8 Coin is identical to the v7 Coin, so
-    /// each coin is copied field for field with no other change. The
-    /// v8 Contract adds four fields after registered_agents
-    /// (rollover_yocto, duel_transfers, position_lots,
-    /// judging_complete) plus the activity ring head, all fresh at
-    /// migrate time. Calling migrate() twice fails: migrate() requires
-    /// the old state's schema_version to be 7, and after the first call
-    /// the stored state is v8 (schema_version 8), so the second call
+    /// registered agents, rollover, duel transfers, purchase lots,
+    /// judging-complete set, activity head). The v9 Contract is
+    /// identical to the v8 Contract, so the copy is a straight move of
+    /// every field. The only v9 change is the launch economics, which
+    /// are constants, not state: launch cost stays 2 NEAR, initial buy
+    /// 0.1-10 NEAR. Calling migrate() twice fails: migrate() requires
+    /// the old state's schema_version to be 8, and after the first call
+    /// the stored state is v9 (schema_version 9), so the second call
     /// panics.
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: OldContract = env::state_read().expect("no v7 state to migrate");
+        let old: OldContractV8 = env::state_read().expect("no v8 state to migrate");
         assert_eq!(
-            old.schema_version, 7,
-            "migrate() only runs on v7 state (schema_version 7); this state is already v8 or another version"
+            old.schema_version, 8,
+            "migrate() only runs on v8 state (schema_version 8); this state is already v9 or another version"
         );
-        let mut coins: LookupMap<u64, Coin> = LookupMap::new(b"c");
-        for id in 0..old.coin_count {
-            if let Some(oc) = old.coins.get(&id) {
-                coins.insert(
-                    id,
-                    Coin {
-                        id: oc.id,
-                        token_id: oc.token_id.clone(),
-                        name: oc.name.clone(),
-                        symbol: oc.symbol.clone(),
-                        description: oc.description.clone(),
-                        creator: oc.creator.clone(),
-                        created_at_ns: oc.created_at_ns,
-                        sold_tokens: oc.sold_tokens,
-                        locked_tokens: oc.locked_tokens,
-                        initial_buy_tokens: oc.initial_buy_tokens,
-                        unlock_at_ns: oc.unlock_at_ns,
-                        creator_sold_after_unlock: oc.creator_sold_after_unlock,
-                        near_reserve_yocto: oc.near_reserve_yocto,
-                        total_spent_yocto: oc.total_spent_yocto,
-                        total_received_yocto: oc.total_received_yocto,
-                        total_supply_tokens: oc.total_supply_tokens,
-                        curve_cap_tokens: oc.curve_cap_tokens,
-                        burned_tokens: oc.burned_tokens,
-                        milestones_fired: oc.milestones_fired.clone(),
-                        airdrop_per_holder: oc.airdrop_per_holder,
-                        airdrop_claimed: oc.airdrop_claimed.clone(),
-                        holders: oc.holders.clone(),
-                        qualified_holders: oc.qualified_holders,
-                        image_url: oc.image_url.clone(),
-                    },
-                );
-            }
-        }
         Self {
             coin_count: old.coin_count,
             battle_count: old.battle_count,
             agent_count: old.agent_count,
             vote_round_count: old.vote_round_count,
             coin_duel_count: old.coin_duel_count,
-            coins,
+            coins: old.coins,
             token_to_coin: old.token_to_coin,
             agents: old.agents,
             positions: old.positions,
@@ -1509,13 +1518,13 @@ impl Contract {
             meme_texts: old.meme_texts,
             ai_scores: old.ai_scores,
             agent_rep: old.agent_rep,
-            schema_version: 8,
+            schema_version: 9,
             registered_agents: old.registered_agents,
-            rollover_yocto: 0,
-            duel_transfers: LookupMap::new(b"u"),
-            position_lots: LookupMap::new(b"l"),
-            judging_complete: LookupSet::new(b"q"),
-            activity_head: 0,
+            rollover_yocto: old.rollover_yocto,
+            duel_transfers: old.duel_transfers,
+            position_lots: old.position_lots,
+            judging_complete: old.judging_complete,
+            activity_head: old.activity_head,
         }
     }
 
@@ -1778,6 +1787,10 @@ impl Contract {
         assert!(
             initial_buy_yocto.0 >= MIN_INITIAL_BUY_YOCTO,
             "initial buy below minimum"
+        );
+        assert!(
+            initial_buy_yocto.0 <= MAX_INITIAL_BUY_YOCTO,
+            "initial buy above maximum"
         );
         assert!(
             attached >= initial_buy_yocto.0 + LAUNCH_COST_YOCTO,
@@ -3666,6 +3679,7 @@ impl Contract {
             battle_min_stake_yocto: BATTLE_MIN_STAKE_YOCTO.to_string(),
             launch_cost_yocto: LAUNCH_COST_YOCTO.to_string(),
             min_initial_buy_yocto: MIN_INITIAL_BUY_YOCTO.to_string(),
+            max_initial_buy_yocto: MAX_INITIAL_BUY_YOCTO.to_string(),
             rep_weight_pnl: REP_W_PNL,
             rep_weight_win_rate: REP_W_WIN,
             rep_weight_hold_time: REP_W_HOLD,
@@ -4705,10 +4719,12 @@ mod tests {
         //   capital as the airdrop pays.
         assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS, 10_000);
         assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS * MILESTONE_HOLDERS_3 as u128, MILESTONE_AIRDROP_TOKENS);
-        // - It equals the tokens from the minimum initial buy (0.01
-        //   NEAR) at launch price (0.000001 NEAR per token), so any
-        //   real holder who buys at least the minimum qualifies.
-        assert_eq!(MIN_INITIAL_BUY_YOCTO / CURVE_BASE_PRICE_YOCTO, MIN_QUALIFIED_HOLDING_TOKENS);
+        // - The minimum initial buy (0.1 NEAR) buys 100,000 tokens
+        //   at launch price (0.000001 NEAR per token) before the fee,
+        //   ten times the threshold, so any creator launching at the
+        //   minimum qualifies.
+        assert_eq!(MIN_INITIAL_BUY_YOCTO / CURVE_BASE_PRICE_YOCTO, 100_000);
+        assert!(MIN_INITIAL_BUY_YOCTO / CURVE_BASE_PRICE_YOCTO >= MIN_QUALIFIED_HOLDING_TOKENS);
         // - It equals 0.001% of the 1,000,000,000 total supply.
         assert_eq!(MIN_QUALIFIED_HOLDING_TOKENS * 100_000, TOTAL_SUPPLY_TOKENS);
     }
@@ -6041,16 +6057,65 @@ mod tests {
 
 
     #[test]
-    fn v8_migrate_v7_to_v8_preserves_state() {
-        // The v7 -> v8 migration must copy every v7 field and
-        // collection verbatim and start the four v8 fields fresh
-        // (rollover 0, empty duel-transfer caps, purchase lots and
-        // judging-complete set, activity head 0). Seed a v7 state with
-        // non-default values, then migrate.
+    fn v9_launch_economics_constants() {
+        // Option 1 (live from v9): launch cost stays 2 NEAR, initial
+        // buy 0.1-10 NEAR. The 2 NEAR launch cost is what funds the new
+        // coin's token account (its 198,066-byte WASM needs ~1.98 NEAR
+        // of storage); a 0.5 NEAR launch cost was proven impossible on
+        // a test arena and must not come back.
+        assert_eq!(LAUNCH_COST_YOCTO, 2_000_000_000_000_000_000_000_000);
+        assert_eq!(MIN_INITIAL_BUY_YOCTO, 100_000_000_000_000_000_000_000);
+        assert_eq!(MAX_INITIAL_BUY_YOCTO, 10_000_000_000_000_000_000_000_000);
+        assert!(MIN_INITIAL_BUY_YOCTO < MAX_INITIAL_BUY_YOCTO);
+    }
+
+    #[test]
+    fn v9_min_initial_buy_qualifies_creator() {
+        // A minimum launch (0.1 NEAR buy, 2.1 NEAR attached) must give
+        // the creator a qualified holding (>= 10,000 tokens). The 1%
+        // fee comes out of the initial buy, so the spendable is
+        // 0.1 * 100/101 NEAR and the creator receives 99,009 tokens.
+        // (buy_with_fee takes the buy amount only; the 2 NEAR launch
+        // cost is a separate attached amount that funds the token
+        // account and is not spent on the curve.)
+        let (tokens, cost, fee) = buy_with_fee(0, MIN_INITIAL_BUY_YOCTO, MAX_CURVE_TOKENS);
+        assert_eq!(tokens, 99_009);
+        assert!(tokens >= MIN_QUALIFIED_HOLDING_TOKENS);
+        // The fee is 1% of the curve cost, and cost + fee stays within
+        // the attached buy amount (the dust is the unspent remainder).
+        assert_eq!(fee, fee_yocto(cost, TRADING_FEE_BP));
+        assert!(cost + fee <= MIN_INITIAL_BUY_YOCTO);
+    }
+
+    #[test]
+    fn v9_max_initial_buy_bounds() {
+        // A maximum launch (10 NEAR buy) stays inside the curve cap
+        // and buys far more than the qualified threshold; the bounds
+        // are 100x apart (0.1 to 10 NEAR).
+        assert_eq!(MAX_INITIAL_BUY_YOCTO / MIN_INITIAL_BUY_YOCTO, 100);
+        let (tokens, _, _) = buy_with_fee(0, MAX_INITIAL_BUY_YOCTO, MAX_CURVE_TOKENS);
+        assert_eq!(tokens, 3_975_247);
+        assert!(tokens > MIN_QUALIFIED_HOLDING_TOKENS);
+        assert!(tokens < MAX_CURVE_TOKENS);
+        // The minimum is the binding floor: a 0.09 NEAR buy would give
+        // fewer tokens than the minimum buy, so the cap and floor are
+        // both real bounds on launch size.
+        let (small, _, _) = buy_with_fee(0, 90_000_000_000_000_000_000_000, MAX_CURVE_TOKENS);
+        let (min_tokens, _, _) = buy_with_fee(0, MIN_INITIAL_BUY_YOCTO, MAX_CURVE_TOKENS);
+        assert!(small < min_tokens);
+    }
+
+    #[test]
+    fn v9_migrate_v8_to_v9_preserves_state() {
+        // The v8 -> v9 migration must copy every v8 field and
+        // collection verbatim, including the v8-only fields (rollover,
+        // duel-transfer caps, purchase lots, judging-complete set,
+        // activity head). Seed a v8 state with non-default values,
+        // then migrate.
         testing_env!(audit_ctx("pac-arena.testnet", 0).build());
         let token_id: AccountId = "c0.pac-arena.testnet".parse().unwrap();
         let creator: AccountId = "creator.testnet".parse().unwrap();
-        let mut old = OldContract {
+        let mut old = OldContractV8 {
             coin_count: 1,
             battle_count: 0,
             agent_count: 1,
@@ -6074,38 +6139,17 @@ mod tests {
             meme_texts: LookupMap::new(b"x"),
             ai_scores: LookupMap::new(b"j"),
             agent_rep: LookupMap::new(b"r"),
-            schema_version: 7,
+            schema_version: 8,
             registered_agents: LookupSet::new(b"g"),
+            rollover_yocto: 500_000_000_000_000_000_000_000,
+            duel_transfers: LookupMap::new(b"u"),
+            position_lots: LookupMap::new(b"l"),
+            judging_complete: LookupSet::new(b"q"),
+            activity_head: 7,
         };
         let mut coin = audit_coin(token_id.clone(), creator.clone());
         coin.qualified_holders = 3;
-        let old_coin = OldCoin {
-            id: coin.id,
-            token_id: coin.token_id.clone(),
-            name: coin.name.clone(),
-            symbol: coin.symbol.clone(),
-            description: coin.description.clone(),
-            creator: coin.creator.clone(),
-            created_at_ns: coin.created_at_ns,
-            sold_tokens: coin.sold_tokens,
-            locked_tokens: coin.locked_tokens,
-            initial_buy_tokens: coin.initial_buy_tokens,
-            unlock_at_ns: coin.unlock_at_ns,
-            creator_sold_after_unlock: coin.creator_sold_after_unlock,
-            near_reserve_yocto: coin.near_reserve_yocto,
-            total_spent_yocto: coin.total_spent_yocto,
-            total_received_yocto: coin.total_received_yocto,
-            total_supply_tokens: coin.total_supply_tokens,
-            curve_cap_tokens: coin.curve_cap_tokens,
-            burned_tokens: coin.burned_tokens,
-            milestones_fired: coin.milestones_fired.clone(),
-            airdrop_per_holder: coin.airdrop_per_holder,
-            airdrop_claimed: coin.airdrop_claimed.clone(),
-            holders: coin.holders.clone(),
-            qualified_holders: coin.qualified_holders,
-            image_url: coin.image_url.clone(),
-        };
-        old.coins.insert(0, old_coin);
+        old.coins.insert(0, coin.clone());
         old.token_to_coin.insert(token_id.clone(), 0);
         old.positions.insert(
             Contract::position_key(&creator, 0),
@@ -6116,25 +6160,30 @@ mod tests {
                 realised_yocto: 0,
             },
         );
+        old.duel_transfers.insert(duel_pair_key(0, 1), 100_000_000_000_000_000_000_000);
+        old.judging_complete.insert("0:0".to_string());
         old.registered_agents.insert(creator.clone());
         env::state_write(&old);
-        // Dropping flushes the old collections to the mock storage,
-        // the way the live chain already holds them.
         drop(old);
         let migrated = Contract::migrate();
-        assert_eq!(migrated.schema_version, 8);
+        assert_eq!(migrated.schema_version, 9);
         assert_eq!(migrated.coin_count, 1);
         assert_eq!(migrated.prize_pool_yocto, 1_000_000_000_000_000_000_000_000);
         assert_eq!(migrated.coins.get(&0).unwrap().qualified_holders, 3);
         assert_eq!(migrated.coins.get(&0).unwrap().near_reserve_yocto, coin.near_reserve_yocto);
         assert_eq!(migrated.holder_tokens(&creator, 0), 10_000);
         assert!(migrated.registered_agents.contains(&creator));
-        assert_eq!(migrated.rollover_yocto, 0);
-        assert!(migrated.duel_transfers.get(&duel_pair_key(0, 1)).is_none());
-        assert!(migrated.position_lots.get(&Contract::position_key(&creator, 0)).is_none());
-        assert!(!migrated.judging_complete.contains(&"0:0".to_string()));
-        assert_eq!(migrated.activity_head, 0);
-        assert_eq!(migrated.get_params().schema_version, 8);
+        assert_eq!(migrated.rollover_yocto, 500_000_000_000_000_000_000_000);
+        assert_eq!(
+            migrated.duel_transfers.get(&duel_pair_key(0, 1)),
+            Some(&100_000_000_000_000_000_000_000u128)
+        );
+        assert!(migrated.judging_complete.contains(&"0:0".to_string()));
+        assert_eq!(migrated.activity_head, 7);
+        assert_eq!(migrated.get_params().schema_version, 9);
+        assert_eq!(migrated.get_params().launch_cost_yocto, "2000000000000000000000000");
+        assert_eq!(migrated.get_params().min_initial_buy_yocto, "100000000000000000000000");
+        assert_eq!(migrated.get_params().max_initial_buy_yocto, "10000000000000000000000000");
         // A second migrate() on the migrated state must fail.
         env::state_write(&migrated);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
