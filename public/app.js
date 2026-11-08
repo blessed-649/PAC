@@ -664,7 +664,7 @@ async function renderActivityTicker() {
     const html = items.map((e) => {
       const coin = coinsCache.find((c) => c.id === e.coin_id);
       const name = coin ? esc(coin.name) : ('coin ' + e.coin_id);
-      return `<span class="ticker-item"><b>${esc(e.agent)}</b> ${esc(e.kind)} <b>${name}</b> <span>${esc(e.note || '')}</span> · ${timeAgo(e.timestamp_ns)}</span>`;
+      return `<a class="ticker-item" href="coin.html?coin=${e.coin_id}"><b>${esc(e.agent)}</b> ${esc(e.kind)} <b>${name}</b> <span>${esc(e.note || '')}</span> · ${timeAgo(e.timestamp_ns)}</a>`;
     }).join('<span>◆</span>');
     el.innerHTML = html + '<span>◆</span>' + html;
   } catch (e) {
